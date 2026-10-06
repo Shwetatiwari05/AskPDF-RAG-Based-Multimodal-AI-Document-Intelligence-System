@@ -236,28 +236,12 @@ def _history_path(user_id: str, pdf_id: str, kind: str) -> Path:
     return STORES_DIR / user_id / pdf_id / f"{kind}_history.json"
 
 
-def load_history(user_id: str, pdf_id: str, kind: str) -> list:
-    path = _history_path(user_id, pdf_id, kind)
-    if path.exists():
-        with open(path) as f:
-            return json.load(f)
-    return []
-
-
-def append_history(user_id: str, pdf_id: str, kind: str, entry: dict) -> list:
-    store = get_store_path(user_id, pdf_id)
-    store.mkdir(parents=True, exist_ok=True)
-    history = load_history(user_id, pdf_id, kind)
-    history.append(entry)
-    with open(_history_path(user_id, pdf_id, kind), "w") as f:
-        json.dump(history, f, indent=2)
-    return history
-
-
-def clear_history(user_id: str, pdf_id: str, kind: str) -> None:
-    path = _history_path(user_id, pdf_id, kind)
-    if path.exists():
-        path.unlink()
+from core.db import (
+    append_history,
+    load_history,
+    clear_history,
+    delete_history,
+)
 
 
 # ── INGEST ────────────────────────────────────────────────────────────────────

@@ -149,7 +149,7 @@ _easyocr_reader = None
 def get_easyocr_reader():
     global _easyocr_reader
     if _easyocr_reader is None:
-        # import easyocr
+        import easyocr
         _easyocr_reader = easyocr.Reader(['en'], gpu=False)
     return _easyocr_reader
 

@@ -67,3 +67,49 @@ def delete_document_db(pdf_id, user_id):
         .eq("user_id", user_id)
         .execute()
     )
+
+def append_history(user_id, pdf_id, history_type, content):
+    return (
+        supabase.table("document_history")
+        .insert({
+            "user_id": user_id,
+            "pdf_id": pdf_id,
+            "history_type": history_type,
+            "content": content,
+        })
+        .execute()
+    )
+
+
+def load_history(user_id, pdf_id, history_type):
+    result = (
+        supabase.table("document_history")
+        .select("content")
+        .eq("user_id", user_id)
+        .eq("pdf_id", pdf_id)
+        .eq("history_type", history_type)
+        .order("created_at")
+        .execute()
+    )
+
+    return [row["content"] for row in result.data]
+
+
+def clear_history(user_id, pdf_id, history_type):
+    return (
+        supabase.table("document_history")
+        .delete()
+        .eq("user_id", user_id)
+        .eq("pdf_id", pdf_id)
+        .eq("history_type", history_type)
+        .execute()
+    )
+
+def delete_history(pdf_id, user_id):
+    return (
+        supabase.table("document_history")
+        .delete()
+        .eq("pdf_id", pdf_id)
+        .eq("user_id", user_id)
+        .execute()
+    )
