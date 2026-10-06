@@ -45,7 +45,7 @@ class ConversationMemory:
         self.history = []
         print("🧹 Conversation memory cleared.")
 
-def generate_answer(query: str, chunks: list, index, memory: ConversationMemory = None) -> tuple:
+def generate_answer(query: str, chunks: list, index, memory: ConversationMemory = None, meta: dict = None) -> tuple:
 
     # Normalize query
     query = query.lower()
@@ -53,13 +53,18 @@ def generate_answer(query: str, chunks: list, index, memory: ConversationMemory 
     query = re.sub(r'handcoded', 'hand coded', query)
     query = re.sub(r'\s+', ' ', query).strip()
 
+    whole_doc_keywords = [
+        "entire", "whole", "all pages", "poora", "summary of the pdf"
+    ]
+    is_whole_doc = any(kw in query for kw in whole_doc_keywords)
+
     results = search(query, index, chunks, top_k=50)
 
     stopwords = {
     "what","is","are","the","a","an",
     "of","in","on","to","for","and",
     "explain","define","tell","me"
-}
+    }
     important_terms = [
     word for word in query.split()
     if word not in stopwords
@@ -73,7 +78,8 @@ def generate_answer(query: str, chunks: list, index, memory: ConversationMemory 
             )
         r["score"] += keyword_hits * 0.05
 
-    results = rerank(query, results, top_k=10)
+    rerank_top_k = 12 if is_whole_doc else 10
+    results = rerank(query, results, top_k=rerank_top_k)
 
     print("\nAFTER RERANK")
 
@@ -81,23 +87,30 @@ def generate_answer(query: str, chunks: list, index, memory: ConversationMemory 
         print(i+1, r["score"])
         print(r["text"][:300])
 
-    """ Iterate through search results and build a context string that includes the text of the most relevant chunks to provide 
-    as context for the LLM to generate an answer based on the document content. Each chunk's text is prefixed with its rank in the search results for clarity"""
-
     context=""
     for i,result in enumerate(results):  
-        context+= f"\n[Chunk {i+1}]:\n{result['text'][:2000]}\n"  # Add the text of each relevant chunk to the context string, prefixed with its rank in the search results 
+        context+= f"\n[Chunk {i+1}]:\n{result['text'][:2000]}\n"
     
-    # Build conversation history string
     history_str = memory.get_context_string() if memory else ""
 
-    # Create a prompt for the LLM that includes instructions to only answer based on the provided context, and includes the relevant chunks retrieved from the vector store as context for answering the question.
+    doc_info = ""
+    if meta:
+        pdf_name = meta.get("pdf_name", "Unknown")
+        page_count = meta.get("page_count", "?")
+        chunk_count = meta.get("chunk_count", "?")
+        word_count = meta.get("word_count", "?")
+        doc_info = f"Document: {pdf_name}, {page_count} pages, {chunk_count} chunks, {word_count} words"
+
+    whole_doc_note = ""
+    if is_whole_doc:
+        whole_doc_note = f"\nNOTE: You have been given the {rerank_top_k} most relevant chunks, which may not cover the whole document. Give a comprehensive answer from them and mention if parts of the document may be missing.\n"
+
     prompt = f"""
 You are a document question-answering assistant.
 
 Use ONLY the provided context.
 
-Rules:
+{doc_info}{whole_doc_note}Rules:
 - Answer using the information available in the context.
 - If the exact answer is not present but related information exists, provide the best possible explanation from the context.
 - Combine information from multiple chunks whenever useful.
@@ -116,9 +129,9 @@ Question: {query}
 Answer:""" 
 
     response = client.chat.completions.create(
-        model="llama-3.1-70b-versatile",
+        model="openai/gpt-oss-120b",
         temperature=0.2,
-        max_tokens=700,
+        max_tokens=2000,
         messages=[{"role": "user", "content": prompt}]
     )
  

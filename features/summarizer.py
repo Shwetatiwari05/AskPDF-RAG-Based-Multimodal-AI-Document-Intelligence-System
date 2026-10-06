@@ -45,9 +45,9 @@ def chunk_text(
 def call_groq(prompt):
     try:
         response = client.chat.completions.create(
-            model="llama-3.1-70b-versatile",
+            model="openai/gpt-oss-120b",
             temperature=0.2,
-            max_tokens=600,
+            max_tokens=2000,
             messages=[
                 {
                     "role": "system",

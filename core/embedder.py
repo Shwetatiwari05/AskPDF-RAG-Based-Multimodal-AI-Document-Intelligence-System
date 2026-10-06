@@ -107,8 +107,6 @@ def generate_embeddings(chunks):
 
 
         embeddings.append(emb)
-        print(f"DEBUG F: after append, embeddings len={len(embeddings)}")
-
         del batch
         del emb
 

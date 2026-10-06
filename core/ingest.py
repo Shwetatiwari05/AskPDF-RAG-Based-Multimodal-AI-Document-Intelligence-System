@@ -289,10 +289,6 @@ def ingest_pdf(
 
     pdf_id = get_pdf_id(str(pdf_path))
     store_path = get_store_path(user_id, pdf_id)
-    print("DEBUG")
-    print("user_id =", user_id)
-    print("pdf_id =", pdf_id)
-    print("store_path =", store_path)
     store_path.mkdir(parents=True, exist_ok=True)
 
     # ── Already ingested? ─────────────────────────────────────────
