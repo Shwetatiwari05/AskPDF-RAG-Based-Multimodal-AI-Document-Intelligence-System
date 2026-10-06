@@ -22,6 +22,9 @@ Usage (CLI uses dummy user_id "default_user"):
 """
 
 import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import re
 import json
 import hashlib
@@ -152,14 +155,56 @@ def get_or_create_thumbnail(user_id: str, pdf_id: str) -> Path | None:
     """
     Return the thumbnail path, generating it on the fly if missing.
     Returns None when the source PDF is no longer accessible.
+    Does NOT trigger full document ingestion/recovery — only downloads
+    the PDF from Supabase Storage to generate the thumbnail.
     """
     store_path = get_store_path(user_id, pdf_id)
     thumb_path = store_path / "thumbnail.png"
     if thumb_path.exists():
         return thumb_path
 
-    if not recover_document_from_storage(user_id, pdf_id):
+    store_path.mkdir(parents=True, exist_ok=True)
+
+    meta = load_metadata(user_id, pdf_id)
+    storage_path = meta.get("storage_path") if meta else None
+
+    if not storage_path:
+        doc = get_document(pdf_id, user_id)
+        if not doc:
+            return None
+        storage_path = doc.get("storage_path")
+        if not storage_path:
+            return None
+        pdf_name = doc.get("pdf_name", f"{pdf_id}.pdf")
+    else:
+        pdf_name = meta.get("pdf_name", f"{pdf_id}.pdf")
+
+    try:
+        pdf_data = supabase.storage.from_("pdfs").download(storage_path)
+    except Exception as e:
+        print(f"[Thumbnail] Download failed: {e}")
         return None
+
+    temp_dir = Path("temp_thumbnail")
+    temp_dir.mkdir(exist_ok=True)
+    temp_path = temp_dir / pdf_name
+
+    try:
+        with open(temp_path, "wb") as f:
+            f.write(pdf_data)
+
+        generate_thumbnail(temp_path, store_path)
+
+    except Exception as e:
+        print(f"[Thumbnail] Generation failed: {e}")
+        return None
+
+    finally:
+        if temp_path.exists():
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
     return thumb_path if thumb_path.exists() else None
 

@@ -1,3 +1,6 @@
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 # from sentence_transformers import SentenceTransformer
 # import numpy as np
 
@@ -56,6 +59,9 @@ def get_model():
             device="cpu"
         )
 
+        import torch
+        torch.set_num_threads(1)
+
         print("MODEL LOADED")
 
     return _model
@@ -101,7 +107,7 @@ def generate_embeddings(chunks):
 
 
         embeddings.append(emb)
-
+        print(f"DEBUG F: after append, embeddings len={len(embeddings)}")
 
         del batch
         del emb

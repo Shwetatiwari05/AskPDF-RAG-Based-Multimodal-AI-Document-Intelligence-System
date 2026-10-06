@@ -7,6 +7,10 @@ Compatible with transformers v4.52+ (pipeline("summarization") removed in newer 
 so we use BartForConditionalGeneration directly — more control, same results).
 """
 
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import torch
 from transformers import BartForConditionalGeneration, BartTokenizer
 import re

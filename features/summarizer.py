@@ -1,4 +1,7 @@
 import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import pdfplumber
 
 from dotenv import load_dotenv
@@ -42,7 +45,7 @@ def chunk_text(
 def call_groq(prompt):
     try:
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="llama-3.1-70b-versatile",
             temperature=0.2,
             max_tokens=600,
             messages=[

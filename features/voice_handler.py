@@ -8,6 +8,11 @@ Flow:
 Install:
     pip install faster-whisper sounddevice scipy
 """
+
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 try:
     import sounddevice as sd
     SOUNDDEVICE_AVAILABLE = True
@@ -20,7 +25,6 @@ except Exception:
 import scipy.io.wavfile as wav
 import numpy as np
 import tempfile
-import os
 
 # ─── LOAD FASTER-WHISPER MODEL ────────────────────────────────────────────────
 
