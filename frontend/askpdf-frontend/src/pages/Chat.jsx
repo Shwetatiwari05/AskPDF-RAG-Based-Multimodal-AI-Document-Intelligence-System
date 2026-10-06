@@ -5,6 +5,7 @@ import AppShell from "../components/layout/AppShell";
 import DocumentPicker from "../components/layout/DocumentPicker";
 import { useDocuments } from "../context/DocumentContext";
 import api from "../lib/api";
+import MarkdownMessage from "../components/MarkdownMessage";
 
 export default function Chat() {
   const { selectedDoc, selectDocument } = useDocuments();
@@ -292,7 +293,7 @@ function MessageBubble({ message }) {
             : "border border-border-soft bg-surface text-text-primary"
         }`}
       >
-        {message.content}
+        {isUser ? message.content : <MarkdownMessage content={message.content} />}
       </div>
 
       {message.sources?.length > 0 && (
