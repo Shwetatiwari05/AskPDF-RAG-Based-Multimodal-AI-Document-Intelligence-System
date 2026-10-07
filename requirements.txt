@@ -38,7 +38,7 @@ pillow
 # AI Providers
 # =========================================================
 groq
-mistralai
+azure-ai-vision-imageanalysis
 
 # =========================================================
 # Voice
