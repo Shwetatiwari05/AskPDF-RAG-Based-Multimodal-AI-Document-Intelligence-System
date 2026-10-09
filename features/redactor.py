@@ -2,18 +2,34 @@
 redactor.py — PDF Redaction Engine
 
 TWO PATHS:
-  Text PDF    → PyMuPDF search_for() → exact coords → redact
-  Scanned PDF → EasyOCR → word bboxes → fuzzy match → redact
+  Text PDF    → PyMuPDF search_for() → exact coords → redact          (unchanged)
+  Scanned PDF → EasyOCR segments → split into WORD boxes (pixel gaps)
+                → regex / custom-term / address matching on the words
+                → black boxes burned into the page image → small JPEG
 
 WHAT GETS REDACTED:
-  email, phone, money, date, aadhaar, pan, credit_card, ifsc,
-  address (street + city + state + country + pincode)
-  via regex + keyword dictionaries
+  email, phone, money, date, aadhaar, pan, credit_card, ifsc, account_number,
+  address (street + city + state + country + pincode), custom terms
+
+SCANNED-PAGE RULES:
+  * Only the matched words are covered, never a whole OCR line / segment.
+  * A match that spans several lines gets one small box per line (no big union box).
+  * Boxes are tight to the ink, so neighbouring lines are not clipped.
+  * Lines that are clearly an address (2+ address cues) are covered fully.
+  * The redaction is burned into the pixels; the original scan is not kept in
+    the output file, so nothing can be recovered by removing an overlay.
+  * If OCR fails on a scanned page, an error is raised (the page is never
+    silently left unredacted).
 """
 
-import os, re, warnings
+import io
+import os
+import re
+import warnings
 from difflib import SequenceMatcher
+
 import fitz
+import numpy as np
 from dotenv import load_dotenv
 
 warnings.filterwarnings("ignore")
@@ -26,14 +42,22 @@ PATTERNS = {
     "date": r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2}[/-]\d{1,2}|(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{1,2}(?:\s*(?:st|nd|rd|th))?,?\s+\d{4}|\d{1,2}(?:\s*(?:st|nd|rd|th))?\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?,?\s+\d{4}|(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4}",
     "aadhaar": r"\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b",
     "pan": r"\b[A-Z]{5}[0-9]{4}[A-Z]\b",
-    "pincode":r"\b\d{6}\b",
+    "pincode": r"\b\d{6}\b",
     "credit_card": r"\b(?:\d{4}[-\s]?){3}\d{4}\b",
-    "ifsc":r"\b[A-Z]{4}0[A-Z0-9]{6}\b",
-    "money":r"₹\s?\d+[\d,]*\.?\d*|Rs\.?\s?\d+[\d,]*|\$\s?\d+[\d,]*\.?\d*|\d+[\d,]*\.?\d*\s?(?:USD|INR|EUR|GBP)",
+    "ifsc": r"\b[A-Z]{4}0[A-Z0-9]{6}\b",
+    "money": r"₹\s?\d+[\d,]*\.?\d*|Rs\.?\s?\d+[\d,]*|\$\s?\d+[\d,]*\.?\d*|\d+[\d,]*\.?\d*\s?(?:USD|INR|EUR|GBP)",
     "account_number": r"\bBSB\s*#?\s*\d[\d\s\-]{4,8}\b|\bACC\s*#?\s*\d[\d\s]{6,17}\b|\bA/C\s*#?\s*\d[\d\s]{6,17}\b",
     # address regex — catches "123 Somewhere St", "Suite 5A-1204", "Flat 4B", "Plot No. 7"
-    "address":r"(?i)\b(?:suite|apt|apartment|flat|floor|unit|plot|house|room|no\.?)\s+[\w\-]+|\b\d+[A-Za-z]?\s+[\w\s]{2,30}(?:street|st|avenue|ave|road|rd|lane|ln|drive|dr|blvd|boulevard|way|court|ct|place|pl|nagar|marg|colony|sector)\b",
+    "address": r"(?i)\b(?:suite|apt|apartment|flat|floor|unit|plot|house|room|no\.?)\s+[\w\-]+|\b\d+[A-Za-z]?\s+[\w\s]{2,30}(?:street|st|avenue|ave|road|rd|lane|ln|drive|dr|blvd|boulevard|way|court|ct|place|pl|nagar|marg|colony|sector)\b",
 }
+
+# Scanned pages only: Indian numbers are often printed as "+91 9898 989898",
+# which the generic phone pattern above does not catch.
+IMAGE_PATTERN_OVERRIDES = {
+    "phone": PATTERNS["phone"]
+    + r"|(?<!\d)(?:\+\s?91[\s\-]?)?[6-9]\d{3,4}[\s\-]?\d{5,6}(?!\d)",
+}
+
 ADDRESS_KEYWORDS = {
     # Structural address words
     'COLONY','MARG','ROAD','LANE','NAGAR','WEST','EAST','NORTH','SOUTH',
@@ -66,6 +90,34 @@ ADDRESS_KEYWORDS = {
     'GERMANY','FRANCE','CHINA','JAPAN','SINGAPORE','DUBAI','UAE','LONDON',
     'CALIFORNIA','TEXAS','FLORIDA','NEW YORK',
 }
+
+# Scanned pages only. Structural words (ROAD, STATE, MAIN ...) only COUNT as
+# address cues, they are never redacted on their own. Place names (cities,
+# states, countries) are redacted word-by-word, or the whole line when the line
+# is clearly an address.
+_STRUCTURAL = {
+    'COLONY','MARG','ROAD','LANE','NAGAR','WEST','EAST','NORTH','SOUTH',
+    'SECTOR','BLOCK','STREET','PLOT','FLAT','HOUSE','APARTMENT','APT',
+    'BUILDING','BLDG','NEAR','OPP','LAYOUT','PHASE','CROSS','MAIN','PARK',
+    'SOCIETY','COMPLEX','TOWER','VTC','CINEMA','EXTENSION','STATE','DISTRICT',
+    'SUBDISTRICT','TALUKA','TEHSIL','VILLAGE','PO','SUB DIVISION','SUBDIVISION',
+}
+_EXTRA_STRUCTURAL = {'UNIT', 'ESTATE', 'INDUSTRIAL'}   # cues only, image path
+IMG_STRUCTURAL_CUES = _STRUCTURAL | _EXTRA_STRUCTURAL
+IMG_PLACE_WORDS = ADDRESS_KEYWORDS - _STRUCTURAL
+# A country on its own ("Government of India") is not redacted; it is covered
+# only when it is part of an address line. Cities and states are redacted alone.
+_COUNTRY_WORDS = {'INDIA','USA','UK','ENGLAND','SCOTLAND','WALES','AUSTRALIA',
+                  'CANADA','GERMANY','FRANCE','CHINA','JAPAN','SINGAPORE','UAE'}
+IMG_PLACE_SINGLE = IMG_PLACE_WORDS - _COUNTRY_WORDS
+
+# ── SCANNED-PAGE SETTINGS ─────────────────────────────────────────────────────
+OUT_DPI = 200            # resolution of the burned-in page image
+OUT_MAX_PX = 3200        # longest side of that image, in pixels
+JPEG_QUALITY = 82
+OCR_MIN_CONF = 0.20      # keep low-confidence text too: better to over-redact
+WORD_GAP_FACTOR = 0.25   # gap (x text height) that separates two words
+ADDRESS_LINE_MIN_CUES = 2
 
 
 # ── PAGE TYPE DETECTION ───────────────────────────────────────────────────────
@@ -106,7 +158,7 @@ def is_address_line(line: str) -> bool:
     return False
 
 
-# ── SENSITIVE STRING COLLECTION ───────────────────────────────────────────────
+# ── SENSITIVE STRING COLLECTION (text pages) ──────────────────────────────────
 
 def collect_sensitive_strings(text: str, redact_types: list, custom_terms: list) -> list:
     found = []
@@ -150,93 +202,356 @@ def get_easyocr_reader():
     global _easyocr_reader
     if _easyocr_reader is None:
         import easyocr
-        _easyocr_reader = easyocr.Reader(['en'], gpu=False)
+        langs = [l.strip() for l in os.getenv("REDACT_OCR_LANGS", "en").split(",") if l.strip()]
+        _easyocr_reader = easyocr.Reader(langs or ['en'], gpu=False)
     return _easyocr_reader
 
 
-def get_easyocr_words(page: fitz.Page) -> list:
-    import numpy as np
-    mat = fitz.Matrix(2, 2)
-    pix = page.get_pixmap(matrix=mat)
-    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+def _ocr_segments(img: np.ndarray) -> list:
+    """
+    Run EasyOCR on an RGB uint8 image (H x W x 3).
+    Returns segments: [{"text": str, "bbox": (x0, y0, x1, y1) in image pixels, "conf": float}]
+    EasyOCR returns phrase/line-level segments, not single words; the words are
+    recovered later in _split_segment().
+    """
+    h, w = img.shape[:2]
+    segs = []
+    for (poly, text, conf) in get_easyocr_reader().readtext(img):
+        if conf < OCR_MIN_CONF or not str(text).strip():
+            continue
+        xs = [float(p[0]) for p in poly]
+        ys = [float(p[1]) for p in poly]
+        segs.append({
+            "text": str(text),
+            "bbox": (max(0.0, min(xs)), max(0.0, min(ys)),
+                     min(float(w), max(xs)), min(float(h), max(ys))),
+            "conf": float(conf),
+        })
+    return segs
 
-    sx = page.rect.width  / pix.width
-    sy = page.rect.height / pix.height
 
-    reader = get_easyocr_reader()
-    results = reader.readtext(img)
+# ── SEGMENT → WORD BOXES ──────────────────────────────────────────────────────
+
+def _otsu_threshold(gray: np.ndarray) -> int:
+    hist = np.bincount(gray.ravel(), minlength=256).astype(np.float64)
+    total = hist.sum()
+    if total == 0:
+        return 128
+    sum_all = float(np.dot(np.arange(256), hist))
+    w_b = sum_b = 0.0
+    best, thr = -1.0, 128
+    for t in range(256):
+        w_b += hist[t]
+        if w_b == 0:
+            continue
+        w_f = total - w_b
+        if w_f == 0:
+            break
+        sum_b += t * hist[t]
+        m_b = sum_b / w_b
+        m_f = (sum_all - sum_b) / w_f
+        var = w_b * w_f * (m_b - m_f) ** 2
+        if var > best:
+            best, thr = var, t
+    return int(thr)
+
+
+def _runs(mask: np.ndarray) -> list:
+    """Runs of True in a 1-D boolean array -> [(start, end_exclusive), ...]"""
+    if mask.size == 0 or not mask.any():
+        return []
+    d = np.diff(np.concatenate(([0], mask.astype(np.int8), [0])))
+    return list(zip(np.where(d == 1)[0].tolist(), np.where(d == -1)[0].tolist()))
+
+
+def _merge_close_runs(runs: list, max_gap: int) -> list:
+    if not runs:
+        return []
+    merged = [list(runs[0])]
+    for s, e in runs[1:]:
+        if s - merged[-1][1] <= max_gap:
+            merged[-1][1] = e
+        else:
+            merged.append([s, e])
+    return [tuple(r) for r in merged]
+
+
+def _proportional_spans(tokens: list, xa: int, xb: int) -> list:
+    """Fallback: split [xa, xb] between the tokens by character count."""
+    weights = [max(1, len(t)) for t in tokens]
+    space = 0.5
+    total = sum(weights) + space * (len(tokens) - 1)
+    unit = (xb - xa) / total if total else 0
+    spans, pos = [], float(xa)
+    for wgt in weights:
+        spans.append((int(round(pos)), int(round(pos + wgt * unit))))
+        pos += wgt * unit + space * unit
+    return spans
+
+
+def _split_segment(gray: np.ndarray, seg: dict) -> list:
+    """
+    Split one OCR segment into word boxes with TIGHT ink bounds.
+    Uses the white gaps between words in the pixels; falls back to a
+    character-proportional split if the gap count does not match the text.
+    """
+    H, W = gray.shape
+    x0, y0, x1, y1 = [int(round(v)) for v in seg["bbox"]]
+    x0, y0, x1, y1 = max(0, x0), max(0, y0), min(W, x1), min(H, y1)
+    tokens = seg["text"].split()
+    if not tokens or x1 - x0 < 2 or y1 - y0 < 2:
+        return []
+
+    crop = gray[y0:y1, x0:x1]
+    box_fallback = lambda spans: [
+        {"text": t, "bbox": (x0 + a, y0, x0 + b, y1)} for t, (a, b) in zip(tokens, spans)
+    ]
+
+    if float(crop.std()) < 10:          # blank / flat area: no ink to measure
+        return box_fallback(_proportional_spans(tokens, 0, x1 - x0))
+
+    ink = crop < _otsu_threshold(crop)
+
+    # keep the main text band (drops neighbouring lines that the box overlaps)
+    row_runs = _merge_close_runs(_runs(ink.sum(axis=1) >= 2), 3)
+    if not row_runs:
+        return box_fallback(_proportional_spans(tokens, 0, x1 - x0))
+    ra, rb = max(row_runs, key=lambda r: int(ink[r[0]:r[1]].sum()))
+    band = ink[ra:rb]
+    h_text = rb - ra
+
+    col_thr = max(1, int(0.05 * h_text))
+    col_runs = _runs(band.sum(axis=0) >= col_thr)
+    if not col_runs:
+        return box_fallback(_proportional_spans(tokens, 0, x1 - x0))
+
+    gap_thr = max(3, WORD_GAP_FACTOR * h_text)
+    groups = [[col_runs[0]]]
+    for prev, cur in zip(col_runs, col_runs[1:]):
+        if cur[0] - prev[1] >= gap_thr:
+            groups.append([cur])
+        else:
+            groups[-1].append(cur)
+    spans = [(g[0][0], g[-1][1]) for g in groups]
+
+    n = len(tokens)
+    if len(spans) > n:                  # too many pieces: merge across the smallest gaps
+        while len(spans) > n:
+            gaps = [spans[i + 1][0] - spans[i][1] for i in range(len(spans) - 1)]
+            j = int(np.argmin(gaps))
+            spans[j] = (spans[j][0], spans[j + 1][1])
+            del spans[j + 1]
+    elif len(spans) < n:                # too few pieces: split by character count
+        spans = _proportional_spans(tokens, spans[0][0], spans[-1][1])
 
     words = []
-    for (bbox_pts, text, conf) in results:
-        if conf < 0.3 or not text.strip():
-            continue
-        xs = [pt[0] for pt in bbox_pts]
-        ys = [pt[1] for pt in bbox_pts]
-        words.append({
-            "text": text,
-            "bbox": (min(xs)*sx, min(ys)*sy, max(xs)*sx, max(ys)*sy),
-            "conf": conf,
-        })
+    for tok, (a, b) in zip(tokens, spans):
+        a, b = max(0, a), max(a + 1, b)
+        sub = band[:, a:b]
+        rr = np.where(sub.sum(axis=1) >= 1)[0]
+        wy0, wy1 = (ra + int(rr[0]), ra + int(rr[-1]) + 1) if rr.size else (ra, rb)
+        words.append({"text": tok, "bbox": (x0 + a, y0 + wy0, x0 + b, y0 + wy1)})
     return words
 
 
-# ── PHRASE MATCHING (EasyOCR words → fitz.Rect) ──────────────────────────────
+def _collect_words(gray: np.ndarray, segs: list) -> list:
+    """All words in reading order, each tagged with its segment id and row id."""
+    order = sorted(range(len(segs)),
+                   key=lambda i: (segs[i]["bbox"][1] + segs[i]["bbox"][3]) / 2)
+    rows = []
+    for i in order:
+        x0, y0, x1, y1 = segs[i]["bbox"]
+        cy, h = (y0 + y1) / 2, max(1.0, y1 - y0)
+        for r in rows:
+            if abs(cy - r["cy"]) <= 0.6 * min(h, r["h"]):
+                r["segs"].append(i)
+                k = len(r["segs"])
+                r["cy"] += (cy - r["cy"]) / k
+                r["h"] += (h - r["h"]) / k
+                break
+        else:
+            rows.append({"cy": cy, "h": h, "segs": [i]})
+    rows.sort(key=lambda r: r["cy"])
 
-def phrase_rects_from_easyocr(phrase: str, easy_words: list, padding: int = 2) -> list:
-    phrase_tokens = tokenize(phrase)
-    if not phrase_tokens:
-        return []
+    words = []
+    for ridx, r in enumerate(rows):
+        for si in sorted(r["segs"], key=lambda i: segs[i]["bbox"][0]):
+            for w in _split_segment(gray, segs[si]):
+                w["seg"], w["row"] = si, ridx
+                words.append(w)
+    return words
 
-    matches = []
 
-    # Single word
-    if len(phrase_tokens) == 1:
-        target = phrase_tokens[0]
-        for word in easy_words:
-            for tok in tokenize(word["text"]):
-                score = SequenceMatcher(None, target, tok).ratio()
-                if score >= 0.88:
-                    x0, y0, x1, y1 = word["bbox"]
-                    matches.append(fitz.Rect(x0-padding, y0-padding, x1+padding, y1+padding))
-                    break
+def _match_text(t: str) -> str:
+    """Text used for pattern matching. A day number followed by OCR junk
+    (superscript 'th' read as quotes/marks, e.g. 28'") becomes just the number."""
+    m = re.fullmatch(r'(\d{1,2})[^\w\s]{1,3}', t)
+    return m.group(1) if m else t
 
-    # Multi-word: sliding window over EasyOCR word list
-    else:
-        target = " ".join(phrase_tokens)
-        word_entries = []
-        for w in easy_words:
-            toks = tokenize(w["text"])
-            if toks:
-                word_entries.append({"tokens": toks, "bbox": w["bbox"]})
 
-        n = len(phrase_tokens)
-        for i in range(len(word_entries) - n + 1):
-            candidate_tokens = []
-            for j in range(n):
-                candidate_tokens.extend(word_entries[i+j]["tokens"])
-            candidate = " ".join(candidate_tokens)
+def _build_stream(words: list):
+    """
+    Join the words into one string for regex matching and remember each word's
+    character span. Words from far-apart columns on the same row are separated
+    by ' ¦ ' so a pattern cannot run across two columns.
+    """
+    parts, spans, pos = [], [], 0
+    for i, w in enumerate(words):
+        if i:
+            p = words[i - 1]
+            if w["row"] != p["row"]:
+                sep = "\n"
+            elif w["seg"] == p["seg"]:
+                sep = " "
+            else:
+                gap = w["bbox"][0] - p["bbox"][2]
+                h = max(1, p["bbox"][3] - p["bbox"][1])
+                sep = " " if gap <= 1.2 * h else " ¦ "
+            parts.append(sep)
+            pos += len(sep)
+        mt = _match_text(w["text"])
+        spans.append((pos, pos + len(mt)))
+        parts.append(mt)
+        pos += len(mt)
+    return "".join(parts), spans
 
-            score = SequenceMatcher(None, target, candidate).ratio()
-            if score < 0.82:
+
+# ── MATCHING ON WORDS ─────────────────────────────────────────────────────────
+
+def _clean_tok(t: str) -> str:
+    # strips spaces/punctuation only, so non-English scripts (e.g. Hindi) still compare
+    return re.sub(r"[\s.,;:!?\-_/\\()\[\]{}\"'|<>*#@&+=~`^%$]", "", t.lower())
+
+
+def _words_for_span(spans: list, start: int, end: int) -> list:
+    return [i for i, (s, e) in enumerate(spans) if s < end and e > start]
+
+
+def _match_words(words: list, stream: str, spans: list,
+                 redact_types: list, custom_terms: list) -> dict:
+    """Returns {word_index: label} for every word that must be covered."""
+    hit = {}
+
+    # 1. regex types (on the joined text, so "28th May 2026", e-mails and phone
+    #    numbers are found even when OCR split them into several words)
+    for rtype in redact_types:
+        if rtype == "address":
+            continue
+        pat = IMAGE_PATTERN_OVERRIDES.get(rtype) or PATTERNS.get(rtype)
+        if not pat:
+            continue
+        for m in re.finditer(pat, stream, re.IGNORECASE):
+            if not m.group(0).strip():
                 continue
+            for i in _words_for_span(spans, m.start(), m.end()):
+                hit.setdefault(i, rtype)
 
-            xs0, ys0, xs1, ys1 = [], [], [], []
-            for j in range(n):
-                x0, y0, x1, y1 = word_entries[i+j]["bbox"]
-                xs0.append(x0); ys0.append(y0)
-                xs1.append(x1); ys1.append(y1)
+    # 2. address: a line that is clearly an address is covered fully, and so are
+    #    the weaker lines directly above/below it (e.g. "E/13, NCH COLONY," above
+    #    "KANJURMARG WEST,"). Other lines: only city / state names.
+    if "address" in redact_types:
+        by_seg = {}
+        for i, w in enumerate(words):
+            by_seg.setdefault(w["seg"], []).append(i)
+        cues, kw_cues, box = {}, {}, {}
+        for sid, idxs in by_seg.items():
+            seg_text = " ".join(words[i]["text"] for i in idxs)
+            c = set()
+            for i in idxs:
+                tok = re.sub(r'[^A-Za-z]', '', words[i]["text"]).upper()
+                if tok in IMG_STRUCTURAL_CUES or tok in IMG_PLACE_WORDS:
+                    c.add(tok)
+            if re.search(PATTERNS["address"], seg_text):
+                c.add("<addr>")
+            kw_cues[sid] = len(c)
+            if re.search(PATTERNS["pincode"], seg_text):
+                c.add("<pin>")
+            cues[sid] = len(c)
+            box[sid] = (min(words[i]["bbox"][0] for i in idxs), min(words[i]["bbox"][1] for i in idxs),
+                        max(words[i]["bbox"][2] for i in idxs), max(words[i]["bbox"][3] for i in idxs))
 
-            matches.append(fitz.Rect(
-                min(xs0)-padding, min(ys0)-padding,
-                max(xs1)+padding, max(ys1)+padding,
-            ))
+        def adjacent(a, b):
+            ax0, ay0, ax1, ay1 = box[a]
+            bx0, by0, bx1, by1 = box[b]
+            overlap = min(ax1, bx1) - max(ax0, bx0)
+            if overlap < 0.3 * min(ax1 - ax0, bx1 - bx0):
+                return False
+            gap = max(0, max(ay0, by0) - min(ay1, by1))
+            return gap <= 1.6 * max(ay1 - ay0, by1 - by0)
 
-    # Deduplicate
-    unique = []
-    for r in matches:
-        if not any(abs(r.x0-u.x0) < 3 and abs(r.y0-u.y0) < 3 for u in unique):
-            unique.append(r)
-    return unique
+        addr = {sid for sid, c in cues.items() if c >= ADDRESS_LINE_MIN_CUES}
+        grew = True
+        while grew:
+            grew = False
+            for sid, c in cues.items():
+                if sid not in addr and kw_cues[sid] >= 1 and any(adjacent(sid, a) for a in addr):
+                    addr.add(sid)
+                    grew = True
+
+        for sid, idxs in by_seg.items():
+            if sid in addr:
+                for i in idxs:
+                    hit.setdefault(i, "address")
+            else:
+                for i in idxs:
+                    tok = re.sub(r'[^A-Za-z]', '', words[i]["text"]).upper()
+                    if tok in IMG_PLACE_SINGLE:
+                        hit.setdefault(i, "address")
+
+    # 3. custom terms (names, codenames): case-insensitive, tolerant to OCR typos,
+    #    may continue on the next line
+    norm = [_clean_tok(w["text"]) for w in words]
+    for term in custom_terms:
+        toks = [t for t in (_clean_tok(x) for x in term.split()) if t]
+        n = len(toks)
+        if not n:
+            continue
+        for i in range(len(words) - n + 1):
+            ok = True
+            for j, tk in enumerate(toks):
+                cand = norm[i + j]
+                if not cand:
+                    ok = False
+                    break
+                if len(tk) <= 3:
+                    good = cand == tk
+                else:
+                    need = 0.90 if len(tk) == 4 else 0.84
+                    good = SequenceMatcher(None, tk, cand).ratio() >= need
+                if not good:
+                    ok = False
+                    break
+            if ok:
+                for j in range(n):
+                    hit.setdefault(i + j, "custom")
+    return hit
+
+
+def _boxes_from_hits(words: list, hit: dict) -> list:
+    """
+    Group hit words into small boxes: one per segment piece, split again when
+    two hit words are far apart. Returns [(x0, y0, x1, y1, label, text)].
+    """
+    boxes, cur, prev_i = [], None, None
+    for i in sorted(hit):
+        w = words[i]
+        x0, y0, x1, y1 = w["bbox"]
+        h = max(1, y1 - y0)
+        if (cur and prev_i == i - 1 and cur["seg"] == w["seg"]
+                and x0 - cur["x1"] <= 3 * h and cur["row"] == w["row"]):
+            cur["x0"], cur["y0"] = min(cur["x0"], x0), min(cur["y0"], y0)
+            cur["x1"], cur["y1"] = max(cur["x1"], x1), max(cur["y1"], y1)
+            cur["text"].append(w["text"])
+            prev_i = i
+        else:
+            prev_i = i
+            if cur:
+                boxes.append(cur)
+            cur = {"seg": w["seg"], "row": w["row"], "x0": x0, "y0": y0, "x1": x1, "y1": y1,
+                   "label": hit[i], "text": [w["text"]]}
+    if cur:
+        boxes.append(cur)
+    return [(b["x0"], b["y0"], b["x1"], b["y1"], b["label"], " ".join(b["text"])) for b in boxes]
 
 
 # ── TEXT PAGE REDACTION ───────────────────────────────────────────────────────
@@ -292,40 +607,61 @@ def redact_text_page(page: fitz.Page, page_num: int,
     page.apply_redactions()
 
 
-# ── IMAGE PAGE REDACTION ──────────────────────────────────────────────────────
+# ── IMAGE (SCANNED) PAGE REDACTION ────────────────────────────────────────────
+
+def _render_page(page: fitz.Page) -> np.ndarray:
+    """Render the page to an RGB uint8 array (the same image is used for OCR and for the output)."""
+    zoom = min(OUT_DPI / 72.0, OUT_MAX_PX / max(page.rect.width, page.rect.height))
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    return np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3).copy()
+
 
 def redact_image_page(page: fitz.Page, page_num: int,
                       redact_types: list, custom_terms: list, audit_log: list):
+    """
+    Redact one scanned page.
+    Returns JPEG bytes of the page with the black boxes burned in, or None if
+    nothing had to be redacted (the caller then keeps the original page).
+    Raises RuntimeError if OCR fails, so a scanned page is never left unredacted by accident.
+    """
     print(f"  Running EasyOCR on page {page_num+1}...")
+    img = _render_page(page)
     try:
-        easy_words = get_easyocr_words(page)
+        segs = _ocr_segments(img)
     except Exception as e:
-        print(f"  [EasyOCR ERROR] {e}")
-        return
+        raise RuntimeError(f"OCR failed on scanned page {page_num+1}: {e}") from e
 
-    if not easy_words:
-        print(f"  [WARN] No words detected on page {page_num+1}")
-        return
+    if not segs:
+        print(f"  [WARN] No text detected on page {page_num+1}")
+        return None
 
-    ocr_text = "\n".join(w["text"] for w in easy_words)
-    sensitives = collect_sensitive_strings(ocr_text, redact_types, custom_terms)
-    print(f"  Words: {len(easy_words)} | Sensitives: {len(sensitives)}")
+    gray = np.asarray(
+        0.299 * img[:, :, 0] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 2], dtype=np.uint8
+    )
+    words = _collect_words(gray, segs)
+    stream, spans = _build_stream(words)
+    hit = _match_words(words, stream, spans, redact_types, custom_terms)
+    boxes = _boxes_from_hits(words, hit)
+    print(f"  Segments: {len(segs)} | Words: {len(words)} | Boxes: {len(boxes)}")
 
-    applied = []
+    if not boxes:
+        return None
 
-    for phrase in sensitives:
-        rects = phrase_rects_from_easyocr(phrase, easy_words)
-        for rect in rects:
-            if any(abs(r.x0-rect.x0) < 3 and abs(r.y0-rect.y0) < 3 for r in applied):
-                continue
-            page.add_redact_annot(rect, fill=(0, 0, 0))
-            applied.append(rect)
-            audit_log.append({"page": page_num+1, "type": "easyocr", "text": phrase})
-            print(f"  ✓ [easyocr] {phrase[:60]}")
-        if not rects:
-            print(f"  ~ [no match] {phrase[:50]}")
+    H, W = img.shape[:2]
+    for (x0, y0, x1, y1, label, text) in boxes:
+        h = max(1, y1 - y0)
+        pad_x, pad_y = max(3, round(0.12 * h)), max(1, round(0.03 * h))
+        a, b = max(0, x0 - pad_x), max(0, y0 - pad_y)
+        c, d = min(W, x1 + pad_x), min(H, y1 + pad_y)
+        img[b:d, a:c] = 0
+        audit_log.append({"page": page_num+1, "type": label, "text": text})
+        print(f"  ✓ [{label}] {text[:60]}")
 
-    page.apply_redactions()
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.fromarray(img).save(buf, format="JPEG", quality=JPEG_QUALITY,
+                              optimize=True, dpi=(OUT_DPI, OUT_DPI))
+    return buf.getvalue()
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
@@ -348,15 +684,26 @@ def redact_pdf(input_path: str, output_path: str,
           f"{len(image_pages)} scanned (EasyOCR) | "
           f"{len(text_pages)} text (search_for)")
 
+    out = fitz.open()
     for page_num, page in enumerate(doc):
         if page_num in image_pages:
             print(f"\nPage {page_num+1}: [SCANNED → EasyOCR]")
-            redact_image_page(page, page_num, redact_types, custom_terms, audit_log)
+            jpeg = redact_image_page(page, page_num, redact_types, custom_terms, audit_log)
+            if jpeg is None:
+                out.insert_pdf(doc, from_page=page_num, to_page=page_num)
+            else:
+                # New page with the original size that holds ONLY the redacted image,
+                # so the original (unredacted) scan is not carried into the output.
+                new_page = out.new_page(width=page.rect.width, height=page.rect.height)
+                new_page.insert_image(new_page.rect, stream=jpeg)
         else:
             print(f"\nPage {page_num+1}: [TEXT → PyMuPDF]")
             redact_text_page(page, page_num, redact_types, custom_terms, audit_log)
+            out.insert_pdf(doc, from_page=page_num, to_page=page_num)
 
-    doc.save(output_path, garbage=4, clean=True)
+    out.set_metadata({})
+    out.save(output_path, garbage=4, deflate=True)
+    out.close()
     doc.close()
 
     print(f"\n✓ Saved: {output_path} | {len(audit_log)} redaction(s)")
