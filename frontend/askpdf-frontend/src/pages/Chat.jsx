@@ -111,26 +111,97 @@ export default function Chat() {
     setMessages([]);
   }
 
+  function showError(content) {
+    setMessages((m) => [...m, { role: "assistant", content, error: true }]);
+  }
+
+  // Browsers differ: Chrome/Firefox record webm/opus, Safari records mp4/m4a.
+  // Pick the first container this browser can actually record.
+  const RECORDING_MIME_TYPES = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/ogg;codecs=opus",
+    "audio/mp4",
+  ];
+
+  function pickMimeType() {
+    if (typeof MediaRecorder === "undefined") return "";
+    return (
+      RECORDING_MIME_TYPES.find((t) => MediaRecorder.isTypeSupported(t)) || ""
+    );
+  }
+
   async function startRecording() {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const recorder = new MediaRecorder(stream);
+    if (!navigator.mediaDevices?.getUserMedia) {
+      showError("Voice input isn't supported in this browser.");
+      return;
+    }
+
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (err) {
+      const blocked =
+        err?.name === "NotAllowedError" || err?.name === "SecurityError";
+      showError(
+        blocked
+          ? "Microphone access was blocked. Allow the mic in your browser settings and try again."
+          : "Could not access the microphone."
+      );
+      return;
+    }
+
+    const mimeType = pickMimeType();
+    const recorder = mimeType
+      ? new MediaRecorder(stream, { mimeType })
+      : new MediaRecorder(stream);
     chunksRef.current = [];
 
-    recorder.ondataavailable = (e) => chunksRef.current.push(e.data);
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size) chunksRef.current.push(e.data);
+    };
+    recorder.onerror = () => stream.getTracks().forEach((t) => t.stop());
     recorder.onstop = async () => {
-      const blob = new Blob(chunksRef.current, { type: "audio/webm" });
       stream.getTracks().forEach((t) => t.stop());
+      const type = recorder.mimeType || mimeType || "audio/webm";
+      const ext = type.includes("mp4")
+        ? "m4a"
+        : type.includes("ogg")
+          ? "ogg"
+          : "webm";
+      const blob = new Blob(chunksRef.current, { type });
+      if (!blob.size) {
+        setTranscribing(false);
+        return;
+      }
       setTranscribing(true);
       try {
-        const res = await api.transcribeAudio(blob);
-        if (res.text) handleSend(res.text);
+        const res = await api.transcribeAudio(blob, `recording.${ext}`);
+        if (res.text) {
+          handleSend(res.text);
+        } else {
+          setMessages((m) => [
+            ...m,
+            {
+              role: "assistant",
+              content: "I couldn't hear anything. Please try again.",
+              error: true,
+            },
+          ]);
+        }
       } catch (err) {
-        console.error("Transcription failed", err);
+        setMessages((m) => [
+          ...m,
+          {
+            role: "assistant",
+            content: err.message || "Voice transcription failed.",
+            error: true,
+          },
+        ]);
       } finally {
         setTranscribing(false);
       }
     };
-
     recorder.start();
     mediaRecorderRef.current = recorder;
     setIsRecording(true);

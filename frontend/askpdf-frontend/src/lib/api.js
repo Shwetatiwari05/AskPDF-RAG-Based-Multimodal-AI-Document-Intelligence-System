@@ -62,7 +62,17 @@ async function request(path, options = {}) {
   });
 
   if (!res.ok) {
-    throw new Error(await res.text());
+    // FastAPI errors are JSON ({"detail": "..."}); surface that message so the
+    // UI shows the server's reason instead of a raw JSON blob.
+    const body = await res.text();
+    let message = body;
+    try {
+      const parsed = JSON.parse(body);
+      message = parsed.detail || parsed.message || body;
+    } catch {
+      /* not JSON, keep the raw text */
+    }
+    throw new Error(message || `Request failed (${res.status})`);
   }
 
   return res.json();
@@ -135,9 +145,9 @@ export const api = {
     `${BASE_URL}/redact/download/${filename}`,
 
   // ── Voice ────────────────────────────────────────────
-  transcribeAudio: (audioBlob) => {
+  transcribeAudio: (audioBlob, filename = "recording.webm") => {
     const form = new FormData();
-    form.append("file", audioBlob, "recording.webm");
+    form.append("file", audioBlob, filename);
     return request("/voice/transcribe", { method: "POST", body: form });
   },
 };

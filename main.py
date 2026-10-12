@@ -36,6 +36,7 @@ from core.auth import get_current_user
 import os
 import re
 import shutil
+import traceback
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -659,6 +660,16 @@ async def download_redacted(filename: str):
 
 # ─── 6. VOICE TRANSCRIPTION ─────────────────────────────────────────────────────
 
+# Upload content-type -> temp-file suffix for the audio decoders.
+_AUDIO_SUFFIX = {
+    "audio/webm": ".webm", "video/webm": ".webm",
+    "audio/ogg": ".ogg", "application/ogg": ".ogg", "audio/opus": ".ogg",
+    "audio/mp4": ".mp4", "audio/m4a": ".m4a", "audio/x-m4a": ".m4a",
+    "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/wave": ".wav",
+    "audio/mpeg": ".mp3",
+}
+
+
 @app.post("/voice/transcribe")
 async def transcribe_voice(
     file: UploadFile = File(...),
@@ -671,16 +682,27 @@ async def transcribe_voice(
 
     from features.voice_handler import transcribe
 
-    original_suffix = Path(file.filename or "").suffix or ".webm"
-    temp_path = UPLOAD_DIR / f"{uuid.uuid4().hex}{original_suffix}"
-
-    with open(temp_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    # Browsers record webm/opus (Chrome/Firefox) or mp4 (Safari); give the temp
+    # file a suffix that matches the upload so the decoder can pick a format.
+    content_type = (file.content_type or "").split(";")[0].strip().lower()
+    suffix = (Path(file.filename or "").suffix
+              or _AUDIO_SUFFIX.get(content_type)
+              or ".webm")
+    temp_path = UPLOAD_DIR / f"{uuid.uuid4().hex}{suffix}"
 
     try:
+        with open(temp_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+
         text = transcribe(str(temp_path), language="en")
-    except Exception as e:
-        raise HTTPException(500, f"Transcription failed: {e}")
+    except Exception:
+        # Full error stays in the server console; the browser only needs a short,
+        # CORS-friendly message instead of an opaque "Failed to fetch".
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail="Could not transcribe the audio. Please try again.",
+        )
     finally:
         if temp_path.exists():
             os.remove(temp_path)

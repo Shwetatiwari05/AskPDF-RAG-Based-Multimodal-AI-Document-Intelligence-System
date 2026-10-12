@@ -128,6 +128,42 @@ def record_until_silence(
 
 # ─── TRANSCRIPTION ────────────────────────────────────────────────────────────
 
+def _decode_audio(audio_path: str, sample_rate: int = 16000) -> np.ndarray:
+    """Decode any container PyAV can read (wav, webm/opus, ogg, mp4/m4a) into a
+    mono float32 array at `sample_rate`.
+
+    faster-whisper's own decoder calls av.open(..., metadata_errors="ignore"),
+    a keyword that PyAV no longer accepts, so it raises TypeError before reading
+    anything. Decoding here and handing the model a numpy array makes it skip
+    that broken path entirely.
+    """
+    import av
+
+    resampler = av.audio.resampler.AudioResampler(
+        format="s16", layout="mono", rate=sample_rate)
+
+    chunks = []
+    with av.open(audio_path, mode="r") as container:
+        frames = iter(container.decode(audio=0))
+        while True:
+            try:
+                frame = next(frames)
+            except StopIteration:
+                break
+            except av.error.InvalidDataError:
+                continue
+            frame.pts = None  # ignore container timestamp checks
+            for out in resampler.resample(frame):
+                chunks.append(out.to_ndarray())
+        for out in resampler.resample(None):  # flush the resampler
+            chunks.append(out.to_ndarray())
+
+    if not chunks:
+        return np.zeros(0, dtype=np.float32)
+    audio = np.concatenate(chunks, axis=-1).reshape(-1)
+    return audio.astype(np.float32) / 32768.0
+
+
 def transcribe(audio_path: str, language: str = "en") -> str:
     """Transcribe audio file to text using faster-whisper."""
 
@@ -135,8 +171,10 @@ def transcribe(audio_path: str, language: str = "en") -> str:
 
     print("Transcribing...")
 
+    audio = _decode_audio(audio_path)
+
     segments, info = model.transcribe(
-        audio_path,
+        audio,
         language=language,
         beam_size=5
     )
