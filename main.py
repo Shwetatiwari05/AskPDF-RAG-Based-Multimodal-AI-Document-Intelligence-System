@@ -598,12 +598,14 @@ async def redact(
     output_filename = f"redacted_{req.pdf_id}_{uuid.uuid4().hex[:8]}.pdf"
     output_path = OUTPUT_DIR / output_filename
 
+    warnings = []
     try:
         redact_pdf(
             input_path=str(original_path),
             output_path=str(output_path),
             redact_types=req.redact_types,
             custom_terms=req.custom_terms,
+            warnings=warnings,
         )
     except Exception as e:
         raise HTTPException(500, f"Redaction failed: {e}")
@@ -629,6 +631,7 @@ async def redact(
     return {
         "status": "success",
         "download_url": download_url,
+        "warnings": warnings,
     }
 
 @app.get("/redact/history/{pdf_id}")

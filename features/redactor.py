@@ -113,6 +113,20 @@ _COUNTRY_WORDS = {'INDIA','USA','UK','ENGLAND','SCOTLAND','WALES','AUSTRALIA',
 # part of a detected address block.
 IMG_PLACE_SINGLE = IMG_PLACE_WORDS - _COUNTRY_WORDS
 
+MONEY_KEYWORDS = {
+    'AMOUNT', 'TOTAL', 'FEE', 'FEES', 'PAID', 'PRICE', 'BALANCE', 'SUBTOTAL', 'TAX', 'GRANDTOTAL', 'DUE'
+}
+
+# OCR-tolerant money pattern for scanned pages (currency optional; accepts
+# common OCR misreads for ₹ like T, ?, % before numbers). Grouping commas
+# allowed in Indian (2,95,500) and Western (295,500) forms; optional decimals.
+_MONEY_SCANNED_RE = re.compile(
+    r"(?:(?:₹|Rs\.?|RS\.?|INR|T|[?%])\s*)?"
+    r"(?:\d{1,3}(?:[,\s]\d{2,3})+(?:\.\d+)?|\d+(?:[,\s]\d{3})+(?:\.\d+)?|\d+\.\d+|\d+)"
+    r"(?:\s*(?:/|per)\s*\w+)?",
+    re.IGNORECASE | re.UNICODE,
+)
+
 # Cue words that also occur commonly in personal names. On their own (single cue,
 # no digit) they must not trigger a full address-line redaction, otherwise names
 # such as "PJ Cross" get eaten.
@@ -182,6 +196,13 @@ def is_page_image_based(page: fitz.Page) -> bool:
     if len(page.get_text("words")) > 20:
         return False
     raw = page.get_text().strip()
+    # Fallback: a page whose extracted text is effectively absent is a scan
+    # (or blank) even when the image is not discoverable via
+    # get_images()/get_image_rects() (e.g. inline images or images nested in a
+    # Form XObject). Only applies when there is essentially no text, so text
+    # pages keep their existing classification.
+    if len(raw) < 10:
+        return True
     if img_ratio > 0.25 and len(raw) < 250:
         return True
     return len(raw) < 100 and img_ratio > 0.5
@@ -754,6 +775,127 @@ def _match_words(words: list, stream: str, spans: list,
     for rtype in redact_types:
         if rtype == "address":
             continue
+        # Special handling for money on scanned pages: currency marker optional,
+        # tolerate OCR misreads (T, ?, % for ₹), accept comma/space groupings and
+        # optional decimals; a bare number must be accompanied by an amount keyword
+        # on the SAME ROW only (keyword located to the LEFT of the number, across
+        # all segments in that row). Reject dates/times/IDs (-/ : or >9 digits).
+        if rtype == "money":
+            # Build rows from segments: same row if vertical centers overlap
+            # Each segment is a word group; we know seg for each word
+            # Build list of segments with bbox
+            seg_ids = sorted(set(w["seg"] for w in words))
+            seg_bbox = {}
+            for sid in seg_ids:
+                sw = [w for w in words if w["seg"] == sid]
+                if not sw:
+                    continue
+                seg_bbox[sid] = (
+                    min(w["bbox"][0] for w in sw),
+                    min(w["bbox"][1] for w in sw),
+                    max(w["bbox"][2] for w in sw),
+                    max(w["bbox"][3] for w in sw),
+                )
+            # group segments into rows
+            rows = []
+            for sid in seg_ids:
+                if sid not in seg_bbox:
+                    continue
+                bx0, by0, bx1, by1 = seg_bbox[sid]
+                cy_s = (by0 + by1) / 2.0
+                h_s = max(1.0, by1 - by0)
+                placed = False
+                for r in rows:
+                    if cy_s >= r["cy0"] - 0.5 * r["h_avg"] and cy_s <= r["cy1"] + 0.5 * r["h_avg"]:
+                        r["segs"].append(sid)
+                        r["cy0"] = min(r["cy0"], by0)
+                        r["cy1"] = max(r["cy1"], by1)
+                        r["h_avg"] = (r["h_avg"] * (len(r["segs"]) - 1) + h_s) / max(1, len(r["segs"]))
+                        placed = True
+                        break
+                if not placed:
+                    rows.append({"segs": [sid], "cy0": by0, "cy1": by1, "h_avg": h_s})
+            # for each row, get joined text in order of segments
+            for r in rows:
+                r["segs"].sort(key=lambda x: seg_bbox.get(x, (0,0,0,0))[0])
+                row_text = " ".join(" ".join(w["text"] for w in sorted(words, key=lambda wi: wi["bbox"][0]) if w["seg"] == s)
+                                    for s in r["segs"])
+                # also store ordered words in row
+                r["words_ordered"] = []
+                for s in r["segs"]:
+                    for w in sorted([ww for ww in words if ww["seg"] == s], key=lambda wi: wi["bbox"][0]):
+                        r["words_ordered"].append(w)
+                r["text"] = row_text
+            # debug removed
+
+            # find candidates in stream
+            for m in _MONEY_SCANNED_RE.finditer(stream):
+                g = m.group(0).strip()
+                if not g:
+                    continue
+                # rejections
+                if '-' in g or '/' in g or ':' in g:
+                    continue
+                dcount = sum(c.isdigit() for c in g)
+                if dcount > 9:
+                    continue
+                s, e = m.start(), m.end()
+                hit_words = _words_for_span(spans, s, e)
+                if not hit_words:
+                    continue
+                x0m = min(words[i]["bbox"][0] for i in hit_words)
+                x1m = max(words[i]["bbox"][2] for i in hit_words)
+                has_cur = bool(re.search(r"₹|Rs\.?|RS\.?|INR|\$|T[^\w]|\?|\%|\u20b9", g, re.IGNORECASE))
+                bare = re.fullmatch(r"(?:\d{1,3}(?:[,\s]\d{2,3})+(?:\.\d+)?|\d+(?:[,\s]\d{3})+(?:\.\d+)?|\d+\.\d+|\d+)", g)
+                accepted = True
+                reason = ""
+                if bare and not has_cur:
+                    # find which row this number is on (overlap vertical center)
+                    cy_m = (min(words[i]["bbox"][1] for i in hit_words) + max(words[i]["bbox"][3] for i in hit_words)) / 2.0
+                    h_m = max(1.0, max(words[i]["bbox"][3] for i in hit_words) - min(words[i]["bbox"][1] for i in hit_words))
+                    # locate row
+                    target_row = None
+                    for r in rows:
+                        if cy_m >= r["cy0"] - 0.5 * r["h_avg"] and cy_m <= r["cy1"] + 0.5 * r["h_avg"]:
+                            target_row = r
+                            break
+                    if not target_row:
+                        accepted, reason = False, "no row found"
+                    else:
+                        # look for keyword to the LEFT of number in this row's ordered words
+                        has_kw_left = False
+                        num_x0 = x0m
+                        for w in target_row["words_ordered"]:
+                            if w["bbox"][2] < num_x0 - 1:  # left
+                                if any(kw in _latinize(w["text"]).upper() for kw in MONEY_KEYWORDS):
+                                    has_kw_left = True
+                                    break
+                        if not has_kw_left:
+                            accepted, reason = False, "no keyword left in row"
+                        else:
+                            accepted, reason = True, "keyword left found"
+                else:
+                    accepted, reason = True, "has currency or explicit"
+
+                if not accepted:
+                    continue
+                for i in hit_words:
+                    hit.setdefault(i, rtype)
+            continue
+            # Build rows from segments: two segments in same row if vertical centers overlap
+            segs_list = list(range(len(words)))  # not directly; use words by segment index
+            # easier: group by segment index
+            pass
+
+        pat = IMAGE_PATTERN_OVERRIDES.get(rtype) or PATTERNS.get(rtype)
+        if not pat:
+            continue
+        for m in re.finditer(pat, stream, re.IGNORECASE):
+            if not m.group(0).strip():
+                continue
+            for i in _words_for_span(spans, m.start(), m.end()):
+                hit.setdefault(i, rtype)
+
         pat = IMAGE_PATTERN_OVERRIDES.get(rtype) or PATTERNS.get(rtype)
         if not pat:
             continue
@@ -1072,13 +1214,16 @@ def _render_page(page: fitz.Page) -> np.ndarray:
 
 
 def redact_image_page(page: fitz.Page, page_num: int,
-                      redact_types: list, custom_terms: list, audit_log: list):
+                      redact_types: list, custom_terms: list, audit_log: list,
+                      warnings: list = None):
     """
     Redact one scanned page.
     Returns JPEG bytes of the page with the black boxes burned in, or None if
     nothing had to be redacted (the caller then keeps the original page).
     Raises RuntimeError if OCR fails, so a scanned page is never left unredacted by accident.
     """
+    if warnings is None:
+        warnings = []
     print(f"  Running EasyOCR on page {page_num+1}...")
     img = _render_page(page)
     try:
@@ -1088,6 +1233,8 @@ def redact_image_page(page: fitz.Page, page_num: int,
 
     if not segs:
         print(f"  [WARN] No text detected on page {page_num+1}")
+        warnings.append(
+            f"Page {page_num+1}: OCR detected no text — nothing was redacted on this page.")
         return None
 
     gray = np.asarray(
@@ -1096,11 +1243,17 @@ def redact_image_page(page: fitz.Page, page_num: int,
     gray_rot = np.ascontiguousarray(np.rot90(gray, k=-1))
     words = _collect_words(gray, segs, gray_rot=gray_rot)
     stream, spans = _build_stream(words)
+
+
+
     hit = _match_words(words, stream, spans, redact_types, custom_terms)
     boxes = _boxes_from_hits(words, hit)
     print(f"  Segments: {len(segs)} | Words: {len(words)} | Boxes: {len(boxes)}")
 
     if not boxes:
+        warnings.append(
+            f"Page {page_num+1}: OCR detected text but no matches for the selected "
+            f"types — nothing was redacted on this page.")
         return None
 
     H, W = img.shape[:2]
@@ -1123,11 +1276,14 @@ def redact_image_page(page: fitz.Page, page_num: int,
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
 def redact_pdf(input_path: str, output_path: str,
-               redact_types: list = None, custom_terms: list = None) -> str:
+               redact_types: list = None, custom_terms: list = None,
+               warnings: list = None) -> str:
     doc          = fitz.open(input_path)
     audit_log    = []
     redact_types = list(redact_types or [])
     custom_terms = list(custom_terms or [])
+    if warnings is None:
+        warnings = []
 
     # address always implies pincode
     if "address" in redact_types and "pincode" not in redact_types:
@@ -1144,7 +1300,7 @@ def redact_pdf(input_path: str, output_path: str,
     for page_num, page in enumerate(doc):
         if page_num in image_pages:
             print(f"\nPage {page_num+1}: [SCANNED → EasyOCR]")
-            jpeg = redact_image_page(page, page_num, redact_types, custom_terms, audit_log)
+            jpeg = redact_image_page(page, page_num, redact_types, custom_terms, audit_log, warnings=warnings)
             if jpeg is None:
                 out.insert_pdf(doc, from_page=page_num, to_page=page_num)
             else:
