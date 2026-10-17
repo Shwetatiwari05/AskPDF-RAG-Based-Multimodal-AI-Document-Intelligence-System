@@ -45,8 +45,8 @@ PATTERNS = {
     "pincode": r"\b\d{6}\b",
     "credit_card": r"\b(?:\d{4}[-\s]?){3}\d{4}\b",
     "ifsc": r"\b[A-Z]{4}0[A-Z0-9]{6}\b",
-    "money": r"₹\s?\d+[\d,]*\.?\d*|Rs\.?\s?\d+[\d,]*|\$\s?\d+[\d,]*\.?\d*|\d+[\d,]*\.?\d*\s?(?:USD|INR|EUR|GBP)",
-    "account_number": r"\bBSB\s*#?\s*\d[\d\s\-]{4,8}\b|\bACC\s*#?\s*\d[\d\s]{6,17}\b|\bA/C\s*#?\s*\d[\d\s]{6,17}\b",
+    "money": r"₹\s?\d+[\d,]*\.?\d*(?:\s?/\s?\w+)?|Rs\.?\s?\d+[\d,]*(?:\s?/\s?\w+)?|\$\s?\d+[\d,]*\.?\d*(?:\s?/\s?\w+)?|\d+[\d,]*\.?\d*\s?(?:USD|INR|EUR|GBP)",
+    "account_number": r"\bBSB\s*(?:#|NO\.?|NUMBER)?\s*[:.]?\s*\d[\d\s\-]{4,8}\b|\b(?:ACC(?:OUNT)?|ACCT)\s*(?:#|NUMBER|NO\.?)?\s*[:.]?\s*\d[\d\s\-]{6,17}\b|\bA/C\s*(?:#|NUMBER|NO\.?)?\s*[:.]?\s*\d[\d\s\-]{6,17}\b",
     # address regex — catches "123 Somewhere St", "Suite 5A-1204", "Flat 4B", "Plot No. 7"
     "address": r"(?i)\b(?:suite|apt|apartment|flat|floor|unit|plot|house|room)\s+[\w\-]+|\b\d+[A-Za-z]?\s+[\w\s]{2,30}(?:street|st|avenue|ave|road|rd|lane|ln|drive|dr|blvd|boulevard|way|court|ct|place|pl|nagar|marg|colony|sector)\b",
 }
