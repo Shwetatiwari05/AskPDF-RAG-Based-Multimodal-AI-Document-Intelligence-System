@@ -1,0 +1,18 @@
+venv/
+venv_old/
+.kilo/
+.git/
+.env
+**/.env
+__pycache__/
+**/__pycache__/
+*.pyc
+frontend/
+node_modules/
+uploads/
+outputs/
+pdf_stores/
+temp_thumbnail/
+features/BART Summarizerrr/
+tests/
+*.md
