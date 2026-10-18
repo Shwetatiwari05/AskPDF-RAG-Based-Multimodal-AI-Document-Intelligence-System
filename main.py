@@ -295,22 +295,26 @@ def get_document_file(
     from core.db import get_document
     from fastapi.responses import FileResponse
 
-    meta = load_metadata(current_user.id, pdf_id)
-    if not meta:
+    doc = get_document(pdf_id, current_user.id)
+    if not doc:
+        print(f"[File 404] branch=no row (DB row missing) user={current_user.id} pdf_id={pdf_id}")
         raise HTTPException(404, "Document not found")
 
-    storage_path = meta.get("storage_path")
-    if not storage_path:
-        doc = get_document(pdf_id, current_user.id)
-        if not doc:
-            raise HTTPException(404, "Document not found")
-        storage_path = doc.get("storage_path")
-        if not storage_path:
-            raise HTTPException(404, "Storage path missing")
+    storage_path = doc.get("storage_path")
+    pdf_name = doc.get("pdf_name")
 
-    pdf_name = meta.get("pdf_name") or (doc.get("pdf_name") if 'doc' in locals() and doc else f"{pdf_id}.pdf")
+    if not storage_path or not pdf_name:
+        meta = load_metadata(current_user.id, pdf_id) or {}
+        storage_path = storage_path or meta.get("storage_path")
+        pdf_name = pdf_name or meta.get("pdf_name")
+
+    if not storage_path:
+        print(f"[File 404] branch=no storage_path user={current_user.id} pdf_id={pdf_id}")
+        raise HTTPException(404, "Storage path missing")
+
+    pdf_name = pdf_name or f"{pdf_id}.pdf"
     store_path = get_store_path(current_user.id, pdf_id)
-    local_file = store_path / pdf_name if pdf_name else store_path / f"{pdf_id}.pdf"
+    local_file = store_path / pdf_name
     if local_file.exists():
         return FileResponse(
             local_file,
@@ -325,6 +329,7 @@ def get_document_file(
             .download(storage_path)
         )
     except Exception as e:
+        print(f"[File 404] branch=download failed: {e!r} user={current_user.id} pdf_id={pdf_id}")
         raise HTTPException(
             404,
             f"PDF not found in storage: {e}"
@@ -591,6 +596,8 @@ async def redact(
             redact_types=req.redact_types,
             custom_terms=req.custom_terms,
             warnings=warnings,
+            user_id=current_user.id,
+            pdf_id=req.pdf_id,
         )
     except Exception as e:
         raise HTTPException(500, f"Redaction failed: {e}")

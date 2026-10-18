@@ -27,6 +27,21 @@ import os
 import re
 import warnings
 from difflib import SequenceMatcher
+import json
+from pathlib import Path
+import time
+
+try:
+    from core.supabase_client import supabase
+except Exception:
+    supabase = None
+
+try:
+    from core.ingest import get_store_path
+except Exception:
+    def get_store_path(user_id: str, pdf_id: str) -> Path:
+        from pathlib import Path
+        return Path("pdf_stores") / str(user_id) / str(pdf_id)
 
 import fitz
 import numpy as np
@@ -168,8 +183,8 @@ _ADDR_STOP_WORDS = {'dear', 'sincerely', 'faithfully', 'regards', 'yours',
 _ADDR_CONT_PATTERNS = [p for k, p in PATTERNS.items() if k not in ('address', 'pincode')]
 
 # ── SCANNED-PAGE SETTINGS ─────────────────────────────────────────────────────
-OUT_DPI = 200            # resolution of the burned-in page image
-OUT_MAX_PX = 3200        # longest side of that image, in pixels
+OUT_DPI = int(os.getenv("OCR_DPI", "200"))            # resolution of the burned-in page image
+OUT_MAX_PX = int(os.getenv("OCR_MAX_PX", "3200"))     # longest side of that image, in pixels
 JPEG_QUALITY = 82
 OCR_MIN_CONF = 0.20      # keep low-confidence text too: better to over-redact
 WORD_GAP_FACTOR = 0.25   # gap (x text height) that separates two words
@@ -410,17 +425,12 @@ def get_easyocr_reader():
     return _easyocr_reader
 
 
-def _ocr_segments(img: np.ndarray) -> list:
+def _ocr_segments(img: np.ndarray, rotated_always: bool = False,
+                  rotate_min_segments: int = 3) -> list:
     """
     Run EasyOCR on an RGB uint8 image (H x W x 3).
     Returns segments: [{"text": str, "bbox": (x0, y0, x1, y1) in image pixels, "conf": float}]
-    EasyOCR returns phrase/line-level segments, not single words; the words are
-    recovered later in _split_segment().
-    A second OCR pass over the image rotated 90° recovers vertically written
-    snippets (e.g. the "Issuance Date: 16/10/2011" strip on aadhaar cards). Those
-    segments are tagged with "rot"; their bbox is mapped back to the upright
-    image, and they carry "rot_bbox" (bbox in the rotated image) so the words can
-    be split correctly.
+    The 90°-rotated pass only runs when needed (few segments) or when forced.
     """
     h, w = img.shape[:2]
     segs = []
@@ -436,38 +446,77 @@ def _ocr_segments(img: np.ndarray) -> list:
             "conf": float(conf),
         })
 
-    rotated = np.ascontiguousarray(np.rot90(img, k=-1))
-    for (poly, text, conf) in get_easyocr_reader().readtext(rotated):
-        if conf < OCR_MIN_CONF or not str(text).strip():
-            continue
-        if not _ROT_SCAN_RE.search(str(text)):
-            continue
-        xr = [float(p[0]) for p in poly]
-        yr = [float(p[1]) for p in poly]
-        x0r, y0r, x1r, y1r = min(xr), min(yr), max(xr), max(yr)
-        # np.rot90(img, k=-1): upright pixel (xo, yo) == rotated (yo, h-1-xo)
-        bbox = (max(0.0, y0r), max(0.0, h - 1 - x1r),
-                min(float(w), y1r), min(float(h), h - 1 - x0r))
-        if bbox[2] - bbox[0] < 3 or bbox[3] - bbox[1] < 3:
-            continue
-        dup = False
-        for s in segs:
-            bx0, by0, bx1, by1 = s["bbox"]
-            ix0, iy0 = max(bbox[0], bx0), max(bbox[1], by0)
-            ix1, iy1 = min(bbox[2], bx1), min(bbox[3], by1)
-            if ix1 > ix0 and iy1 > iy0:
-                inter = (ix1 - ix0) * (iy1 - iy0)
-                if inter / max(1.0, (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])) > 0.3 \
-                        or inter / max(1.0, (bx1 - bx0) * (by1 - by0)) > 0.3:
-                    dup = True
-                    break
-        if dup:
-            continue
-        segs.append({"text": str(text),
-                     "bbox": bbox,
-                     "rot_bbox": (x0r, y0r, x1r, y1r),
-                     "conf": float(conf)})
+    if rotated_always or len(segs) < rotate_min_segments:
+        rotated = np.ascontiguousarray(np.rot90(img, k=-1))
+        for (poly, text, conf) in get_easyocr_reader().readtext(rotated):
+            if conf < OCR_MIN_CONF or not str(text).strip():
+                continue
+            xs = [float(p[0]) for p in poly]
+            ys = [float(p[1]) for p in poly]
+            rx0, ry0, rx1, ry1 = (max(0.0, min(xs)), max(0.0, min(ys)),
+                                  min(float(rotated.shape[1]), max(xs)),
+                                  min(float(rotated.shape[0]), max(ys)))
+            x0r, y0r = ry0, rotated.shape[1] - rx1
+            x1r, y1r = ry1, rotated.shape[1] - rx0
+            segs.append({
+                "text": str(text),
+                "bbox": (x0r, y0r, x1r, y1r),
+                "conf": float(conf),
+                "rot": True,
+                "rot_bbox": (rx0, ry0, rx1, ry1),
+            })
     return segs
+
+
+def _get_cached_ocr(user_id: str | None, pdf_id: str | None, page_num: int,
+                    dpi: int, max_px: int) -> list | None:
+    key_local = None
+    try:
+        if user_id is not None and pdf_id is not None:
+            store_path = get_store_path(user_id, pdf_id)
+            store_path.mkdir(parents=True, exist_ok=True)
+            key_local = store_path / f"ocr_page_{page_num}_{dpi}_{max_px}.json"
+            if key_local.exists():
+                with open(key_local, "r") as f:
+                    return json.load(f)
+    except Exception:
+        pass
+
+    try:
+        if supabase is not None and user_id is not None and pdf_id is not None:
+            storage_path = f"ocr_cache/{user_id}/{pdf_id}/page_{page_num}_{dpi}_{max_px}.json"
+            data = supabase.storage.from_("pdfs").download(storage_path)
+            if isinstance(data, (bytes, bytearray)):
+                return json.loads(data.decode("utf-8"))
+            return json.loads(str(data))
+    except Exception:
+        pass
+    return None
+
+
+def _set_cached_ocr(user_id: str | None, pdf_id: str | None, page_num: int,
+                    dpi: int, max_px: int, segs: list) -> None:
+    try:
+        if user_id is not None and pdf_id is not None:
+            store_path = get_store_path(user_id, pdf_id)
+            store_path.mkdir(parents=True, exist_ok=True)
+            key_local = store_path / f"ocr_page_{page_num}_{dpi}_{max_px}.json"
+            with open(key_local, "w") as f:
+                json.dump(segs, f)
+    except Exception:
+        pass
+
+    try:
+        if supabase is not None and user_id is not None and pdf_id is not None:
+            storage_path = f"ocr_cache/{user_id}/{pdf_id}/page_{page_num}_{dpi}_{max_px}.json"
+            payload = json.dumps(segs).encode("utf-8")
+            supabase.storage.from_("pdfs").upload(
+                path=storage_path,
+                file=payload,
+                file_options={"content-type": "application/json"}
+            )
+    except Exception:
+        pass
 
 
 # ── SEGMENT → WORD BOXES ──────────────────────────────────────────────────────
@@ -1387,14 +1436,17 @@ def redact_text_page(page: fitz.Page, page_num: int,
 
 def _render_page(page: fitz.Page) -> np.ndarray:
     """Render the page to an RGB uint8 array (the same image is used for OCR and for the output)."""
-    zoom = min(OUT_DPI / 72.0, OUT_MAX_PX / max(page.rect.width, page.rect.height))
+    dpi = int(os.getenv("OCR_DPI", "200"))
+    max_px = int(os.getenv("OCR_MAX_PX", "3200"))
+    zoom = min(dpi / 72.0, max_px / max(page.rect.width, page.rect.height))
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
     return np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3).copy()
 
 
 def redact_image_page(page: fitz.Page, page_num: int,
                       redact_types: list, custom_terms: list, audit_log: list,
-                      warnings: list = None):
+                      warnings: list = None, user_id: str | None = None,
+                      pdf_id: str | None = None):
     """
     Redact one scanned page.
     Returns JPEG bytes of the page with the black boxes burned in, or None if
@@ -1403,12 +1455,21 @@ def redact_image_page(page: fitz.Page, page_num: int,
     """
     if warnings is None:
         warnings = []
-    print(f"  Running EasyOCR on page {page_num+1}...")
+    cache_hit = "miss"
+    dpi = int(os.getenv("OCR_DPI", "200"))
+    max_px = int(os.getenv("OCR_MAX_PX", "3200"))
+    rotate_min_segments = int(os.getenv("OCR_ROTATE_MIN_SEGMENTS", "3"))
+    rotated_always = os.getenv("OCR_ALWAYS_ROTATE", "0") == "1"
+    start = time.time()
     img = _render_page(page)
-    try:
-        segs = _ocr_segments(img)
-    except Exception as e:
-        raise RuntimeError(f"OCR failed on scanned page {page_num+1}: {e}") from e
+    segs = _get_cached_ocr(user_id, pdf_id, page_num, dpi, max_px)
+    if segs is not None:
+        cache_hit = "hit"
+    else:
+        segs = _ocr_segments(img, rotated_always=rotated_always, rotate_min_segments=rotate_min_segments)
+        _set_cached_ocr(user_id, pdf_id, page_num, dpi, max_px, segs)
+    elapsed = time.time() - start
+    print(f"[OCR] page {page_num+1}: {cache_hit}, {elapsed:.1f} s")
 
     if not segs:
         print(f"  [WARN] No text detected on page {page_num+1}")
@@ -1456,7 +1517,8 @@ def redact_image_page(page: fitz.Page, page_num: int,
 
 def redact_pdf(input_path: str, output_path: str,
                redact_types: list = None, custom_terms: list = None,
-               warnings: list = None) -> str:
+               warnings: list = None,
+               user_id: str | None = None, pdf_id: str | None = None) -> str:
     doc          = fitz.open(input_path)
     audit_log    = []
     redact_types = list(redact_types or [])
@@ -1479,7 +1541,7 @@ def redact_pdf(input_path: str, output_path: str,
     for page_num, page in enumerate(doc):
         if page_num in image_pages:
             print(f"\nPage {page_num+1}: [SCANNED → EasyOCR]")
-            jpeg = redact_image_page(page, page_num, redact_types, custom_terms, audit_log, warnings=warnings)
+            jpeg = redact_image_page(page, page_num, redact_types, custom_terms, audit_log, warnings=warnings, user_id=user_id, pdf_id=pdf_id)
             if jpeg is None:
                 out.insert_pdf(doc, from_page=page_num, to_page=page_num)
             else:

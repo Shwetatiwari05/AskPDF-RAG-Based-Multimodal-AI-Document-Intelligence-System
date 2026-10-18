@@ -170,19 +170,19 @@ def get_or_create_thumbnail(user_id: str, pdf_id: str) -> Path | None:
     except Exception:
         pass
 
-    meta = load_metadata(user_id, pdf_id)
-    storage_path = meta.get("storage_path") if meta else None
+    doc = get_document(pdf_id, user_id)
+    storage_path = doc.get("storage_path") if doc else None
+    pdf_name = doc.get("pdf_name") if doc else None
+
+    if not storage_path or not pdf_name:
+        meta = load_metadata(user_id, pdf_id) or {}
+        storage_path = storage_path or meta.get("storage_path")
+        pdf_name = pdf_name or meta.get("pdf_name")
 
     if not storage_path:
-        doc = get_document(pdf_id, user_id)
-        if not doc:
-            return None
-        storage_path = doc.get("storage_path")
-        if not storage_path:
-            return None
-        pdf_name = doc.get("pdf_name", f"{pdf_id}.pdf")
-    else:
-        pdf_name = meta.get("pdf_name", f"{pdf_id}.pdf")
+        return None
+
+    pdf_name = pdf_name or f"{pdf_id}.pdf"
 
     try:
         pdf_data = supabase.storage.from_("pdfs").download(storage_path)
