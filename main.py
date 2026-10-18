@@ -46,41 +46,6 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 
-# from fastapi import Depends
-# from core.auth import get_current_user
-# import os
-# import shutil
-# import uuid
-# from datetime import datetime
-# from pathlib import Path
-
-# from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-# from fastapi.middleware.cors import CORSMiddleware
-# from fastapi.responses import FileResponse
-# from pydantic import BaseModel
-
-# ─── EXISTING PROJECT MODULES ─────────────────────────────────────────────────
-# print("Loading ingest")
-# from core.ingest import (
-#     ingest_pdf,
-#     list_pdfs,
-#     load_pdf_store,
-#     delete_pdf_store,
-#     load_history,
-#     append_history,
-#     clear_history,
-#     load_metadata,
-#     get_or_create_thumbnail,
-# )
-# print("Loading rag")
-# from core.rag_engine import generate_answer, ConversationMemory
-
-# print("Loading summarizer")
-# from features.summarizer import summarize_plain_text
-
-# print("Loading redactor")
-# from features.redactor import redact_pdf
-
 print("Loading db")
 from core.db import (
     insert_document,
@@ -300,7 +265,7 @@ async def delete_document(
 
 
 @app.get("/documents/{pdf_id}/thumbnail")
-async def get_document_thumbnail(
+def get_document_thumbnail(
     pdf_id: str,
     current_user = Depends(get_current_user)
 ):
@@ -322,21 +287,36 @@ async def get_document_thumbnail(
 
 
 @app.get("/documents/{pdf_id}/file")
-async def get_document_file(
+def get_document_file(
     pdf_id: str,
     current_user=Depends(get_current_user)
 ):
-    from core.ingest import load_metadata
+    from core.ingest import load_metadata, get_store_path
+    from core.db import get_document
+    from fastapi.responses import FileResponse
 
     meta = load_metadata(current_user.id, pdf_id)
-
     if not meta:
         raise HTTPException(404, "Document not found")
 
     storage_path = meta.get("storage_path")
-
     if not storage_path:
-        raise HTTPException(404, "Storage path missing")
+        doc = get_document(pdf_id, current_user.id)
+        if not doc:
+            raise HTTPException(404, "Document not found")
+        storage_path = doc.get("storage_path")
+        if not storage_path:
+            raise HTTPException(404, "Storage path missing")
+
+    pdf_name = meta.get("pdf_name") or (doc.get("pdf_name") if 'doc' in locals() and doc else f"{pdf_id}.pdf")
+    store_path = get_store_path(current_user.id, pdf_id)
+    local_file = store_path / pdf_name if pdf_name else store_path / f"{pdf_id}.pdf"
+    if local_file.exists():
+        return FileResponse(
+            local_file,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'inline; filename="{pdf_name}"'},
+        )
 
     try:
         data = (
@@ -344,19 +324,23 @@ async def get_document_file(
             .from_("pdfs")
             .download(storage_path)
         )
-
     except Exception as e:
         raise HTTPException(
             404,
             f"PDF not found in storage: {e}"
         )
 
-    return Response(
-        content=data,
+    store_path.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(local_file, "wb") as f:
+            f.write(data)
+    except Exception:
+        pass
+
+    return FileResponse(
+        local_file,
         media_type="application/pdf",
-        headers={
-            "Content-Disposition": f'inline; filename="{meta["pdf_name"]}"'
-        }
+        headers={"Content-Disposition": f'inline; filename="{pdf_name}"'},
     )
 
 

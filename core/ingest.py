@@ -132,7 +132,7 @@ def recover_document_from_storage(user_id: str, pdf_id: str) -> bool:
 
 def generate_thumbnail(pdf_path: Path, store_path: Path) -> None:
     """
-    Render page 1 to ~320px-wide PNG. Best-effort — failure never blocks
+    Render page 1 to ~300px-wide PNG. Best-effort — failure never blocks
     ingestion because thumbnails are cosmetic.
     """
     try:
@@ -141,7 +141,7 @@ def generate_thumbnail(pdf_path: Path, store_path: Path) -> None:
             doc.close()
             return
         page = doc.load_page(0)
-        zoom = 320 / max(page.rect.width, 1)
+        zoom = 300 / max(page.rect.width, 1)
         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
         pix.save(str(store_path / "thumbnail.png"))
         doc.close()
@@ -153,8 +153,6 @@ def get_or_create_thumbnail(user_id: str, pdf_id: str) -> Path | None:
     """
     Return the thumbnail path, generating it on the fly if missing.
     Returns None when the source PDF is no longer accessible.
-    Does NOT trigger full document ingestion/recovery — only downloads
-    the PDF from Supabase Storage to generate the thumbnail.
     """
     store_path = get_store_path(user_id, pdf_id)
     thumb_path = store_path / "thumbnail.png"
@@ -162,6 +160,15 @@ def get_or_create_thumbnail(user_id: str, pdf_id: str) -> Path | None:
         return thumb_path
 
     store_path.mkdir(parents=True, exist_ok=True)
+
+    thumb_storage_path = f"thumbnails/{user_id}/{pdf_id}.png"
+    try:
+        data = supabase.storage.from_("pdfs").download(thumb_storage_path)
+        with open(thumb_path, "wb") as f:
+            f.write(data)
+        return thumb_path
+    except Exception:
+        pass
 
     meta = load_metadata(user_id, pdf_id)
     storage_path = meta.get("storage_path") if meta else None
@@ -203,6 +210,17 @@ def get_or_create_thumbnail(user_id: str, pdf_id: str) -> Path | None:
                 os.remove(temp_path)
             except OSError:
                 pass
+
+    if thumb_path.exists():
+        try:
+            with open(thumb_path, "rb") as f:
+                supabase.storage.from_("pdfs").upload(
+                    path=thumb_storage_path,
+                    file=f,
+                    file_options={"content-type": "image/png"}
+                )
+        except Exception as e:
+            print(f"[Thumbnail] Upload failed (non-fatal): {e}")
 
     return thumb_path if thumb_path.exists() else None
 
