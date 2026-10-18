@@ -153,7 +153,6 @@ PDF pages → render to images → OCR → extracted text → chunking → embed
 │   ├── db.py                  # documents + history CRUD
 │   ├── ingest.py              # ingest pipeline, per-user stores, thumbnails
 │   ├── ocr_extractor.py       # scanned detection + Azure AI Vision OCR
-│   ├── pdf_extractor.py       # pdfplumber extraction + boilerplate removal
 │   ├── preprocess.py          # clean_text + sentence-aware chunking
 │   ├── embedder.py            # SentenceTransformer embeddings
 │   ├── vector_store.py        # FAISS build/search + cross-encoder rerank

@@ -25,3 +25,6 @@ ocr/
 *.index
 *.pkl
 summary.txt
+
+# Local-only (kept on disk, removed from git)
+features/BART Summarizerrr/

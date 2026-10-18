@@ -25,3 +25,6 @@ node_modules/
 chunks.pkl
 vector_store.index
 summary.txt
+
+# Build output
+dist/
