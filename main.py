@@ -599,6 +599,7 @@ async def redact(
     output_path = OUTPUT_DIR / output_filename
 
     warnings = []
+    print(f"[Redact][dbg] custom_terms received = {req.custom_terms!r}")
     try:
         redact_pdf(
             input_path=str(original_path),

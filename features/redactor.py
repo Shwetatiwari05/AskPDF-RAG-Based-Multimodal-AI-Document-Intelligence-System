@@ -765,145 +765,279 @@ def _words_for_span(spans: list, start: int, end: int) -> list:
     return [i for i, (s, e) in enumerate(spans) if s < end and e > start]
 
 
+# ── SHADOW COPY (same length as the OCR stream) ──────────────────────────────
+# Inside numeric-looking tokens an OCR misread digit is often a confusable
+# letter (O for 0, S for 5, ...). The shadow copy rewrites only those chars so
+# PATTERNS can match the corrected text without any pattern change.
+
+_MONTH_ABBRS = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+                "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+# digit misread -> the letters it can stand for (spec confusion table)
+_MONTH_CONF = {
+    '4': ('A',), '0': ('U', 'O'), '6': ('G',), '5': ('S',),
+    '1': ('I', 'L'), '8': ('B',), '2': ('Z',),
+}
+# day + separator + 2-4 char token + separator + 4-digit year
+_DATE_FIX_RE = re.compile(
+    r"(\d{1,2})(\s*[\/\-.]\s*|\s+)([A-Za-z0-9]{2,4})(\s*[\/\-.]\s*|\s+)(\d{4})"
+)
+_CONFUSABLE_DIGIT = set("OoIl|SBZz")
+
+
+def _month_confusable(token: str):
+    """If `token` (3-4 chars) is a confusable misread of exactly one month
+    abbreviation, return that 3-letter month, else None."""
+    if len(token) not in (3, 4):
+        return None
+    t = token[:3].upper()
+    matches = []
+    for m in _MONTH_ABBRS:
+        ok = True
+        for tc, mc in zip(t, m):
+            if tc == mc:
+                continue
+            alts = _MONTH_CONF.get(tc)
+            if not alts or mc not in alts:
+                ok = False
+                break
+        if ok and t != m:          # a real misread, not the month itself
+            matches.append(m)
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _build_shadow(stream: str) -> str:
+    """Same-length copy of `stream` with (1) digit confusables fixed inside
+    numeric-looking tokens and (2) confusable month misreads in date shapes
+    replaced by the real month. Length is always identical to `stream`."""
+    out = list(stream)
+
+    # 1. digit confusables inside numeric tokens (O->0, I/l/|->1, S->5, B->8, Z->2)
+    for m in re.finditer(r"\S+", stream):
+        tok = m.group(0)
+        core = re.sub(r"[^0-9A-Za-z]", "", tok)
+        if not core:
+            continue
+        digits = sum(c.isdigit() for c in core)
+        if digits < 1 or digits * 2 < len(core):
+            continue                      # not mostly digits
+        # If the token contains a real letter (not a digit lookalike) we only
+        # rewrite confusables that sit between two digits, so "Rs500" keeps its
+        # currency prefix while "295,5O0" / "162O23" get corrected.
+        has_other = any(c.isalpha() and c not in _CONFUSABLE_DIGIT for c in core)
+        for j, c in enumerate(tok):
+            if c not in _CONFUSABLE_DIGIT:
+                continue
+            if has_other and not (0 < j < len(tok) - 1
+                                  and tok[j - 1].isdigit() and tok[j + 1].isdigit()):
+                continue
+            out[m.start() + j] = {"O": "0", "o": "0", "I": "1", "l": "1",
+                                  "|": "1", "S": "5", "s": "5", "B": "8",
+                                  "b": "8", "Z": "2", "z": "2"}[c]
+
+    # 2. date middle-token month fix, applied on the digit-corrected text
+    cur = "".join(out)
+    for m in _DATE_FIX_RE.finditer(cur):
+        mid = m.group(3)
+        month = _month_confusable(mid)
+        if not month:
+            continue
+        if len(mid) == 3:
+            repl = month
+        elif len(mid) == 4:
+            repl = month + mid[3]        # keep the 4th char, same length
+        else:
+            continue
+        s1 = m.start(3)
+        for j, c in enumerate(repl):
+            out[s1 + j] = c
+        # Turn the two separators around the month (groups 2 and 4) into plain
+        # spaces, so "14-406-2026" -> "14 AUG 2026" and PATTERNS["date"]'s
+        # month-name branch matches. Each replaced char is 1:1, length unchanged.
+        for gi in (2, 4):
+            for k in range(m.start(gi), m.end(gi)):
+                if out[k] in ("-", "/", "."):
+                    out[k] = " "
+    return "".join(out)
+
+
 def _match_words(words: list, stream: str, spans: list,
                  redact_types: list, custom_terms: list) -> dict:
     """Returns {word_index: label} for every word that must be covered."""
     hit = {}
 
-    # 1. regex types (on the joined text, so "28th May 2026", e-mails and phone
-    #    numbers are found even when OCR split them into several words)
+    print(f"  [dbg] joined OCR stream = {stream!r}")
+
+    # 1. regex types. The joined OCR stream is matched once with the text-path
+    #    patterns on the ORIGINAL text and once on a same-length SHADOW copy
+    #    (digit confusables / month misreads corrected). Hits from both passes
+    #    are unioned; the same char-offset->word spans map both back to boxes.
+    #    No pattern is copied into the scanned path.
+    shadow = _build_shadow(stream)
+
+    # Rows (needed by the money OCR fallback for the keyword-to-the-left rule):
+    # segments whose vertical centres overlap share a row.
+    seg_ids = sorted(set(w["seg"] for w in words))
+    seg_bbox = {}
+    for sid in seg_ids:
+        sw = [w for w in words if w["seg"] == sid]
+        if not sw:
+            continue
+        seg_bbox[sid] = (
+            min(w["bbox"][0] for w in sw),
+            min(w["bbox"][1] for w in sw),
+            max(w["bbox"][2] for w in sw),
+            max(w["bbox"][3] for w in sw),
+        )
+    rows = []
+    for sid in seg_ids:
+        if sid not in seg_bbox:
+            continue
+        bx0, by0, bx1, by1 = seg_bbox[sid]
+        cy_s = (by0 + by1) / 2.0
+        h_s = max(1.0, by1 - by0)
+        placed = False
+        for r in rows:
+            if cy_s >= r["cy0"] - 0.5 * r["h_avg"] and cy_s <= r["cy1"] + 0.5 * r["h_avg"]:
+                r["segs"].append(sid)
+                r["cy0"] = min(r["cy0"], by0)
+                r["cy1"] = max(r["cy1"], by1)
+                r["h_avg"] = (r["h_avg"] * (len(r["segs"]) - 1) + h_s) / max(1, len(r["segs"]))
+                placed = True
+                break
+        if not placed:
+            rows.append({"segs": [sid], "cy0": by0, "cy1": by1, "h_avg": h_s})
+    for r in rows:
+        r["segs"].sort(key=lambda x: seg_bbox.get(x, (0, 0, 0, 0))[0])
+        r["words_ordered"] = []
+        for s in r["segs"]:
+            for w in sorted([ww for ww in words if ww["seg"] == s],
+                            key=lambda wi: wi["bbox"][0]):
+                r["words_ordered"].append(w)
+
+    phone_hits = []      # (matched_string, [word indices]) for the phone post-filter
+
     for rtype in redact_types:
         if rtype == "address":
             continue
-        # Special handling for money on scanned pages: currency marker optional,
-        # tolerate OCR misreads (T, ?, % for ₹), accept comma/space groupings and
-        # optional decimals; a bare number must be accompanied by an amount keyword
-        # on the SAME ROW only (keyword located to the LEFT of the number, across
-        # all segments in that row). Reject dates/times/IDs (-/ : or >9 digits).
-        if rtype == "money":
-            # Build rows from segments: same row if vertical centers overlap
-            # Each segment is a word group; we know seg for each word
-            # Build list of segments with bbox
-            seg_ids = sorted(set(w["seg"] for w in words))
-            seg_bbox = {}
-            for sid in seg_ids:
-                sw = [w for w in words if w["seg"] == sid]
-                if not sw:
-                    continue
-                seg_bbox[sid] = (
-                    min(w["bbox"][0] for w in sw),
-                    min(w["bbox"][1] for w in sw),
-                    max(w["bbox"][2] for w in sw),
-                    max(w["bbox"][3] for w in sw),
-                )
-            # group segments into rows
-            rows = []
-            for sid in seg_ids:
-                if sid not in seg_bbox:
-                    continue
-                bx0, by0, bx1, by1 = seg_bbox[sid]
-                cy_s = (by0 + by1) / 2.0
-                h_s = max(1.0, by1 - by0)
-                placed = False
-                for r in rows:
-                    if cy_s >= r["cy0"] - 0.5 * r["h_avg"] and cy_s <= r["cy1"] + 0.5 * r["h_avg"]:
-                        r["segs"].append(sid)
-                        r["cy0"] = min(r["cy0"], by0)
-                        r["cy1"] = max(r["cy1"], by1)
-                        r["h_avg"] = (r["h_avg"] * (len(r["segs"]) - 1) + h_s) / max(1, len(r["segs"]))
-                        placed = True
-                        break
-                if not placed:
-                    rows.append({"segs": [sid], "cy0": by0, "cy1": by1, "h_avg": h_s})
-            # for each row, get joined text in order of segments
-            for r in rows:
-                r["segs"].sort(key=lambda x: seg_bbox.get(x, (0,0,0,0))[0])
-                row_text = " ".join(" ".join(w["text"] for w in sorted(words, key=lambda wi: wi["bbox"][0]) if w["seg"] == s)
-                                    for s in r["segs"])
-                # also store ordered words in row
-                r["words_ordered"] = []
-                for s in r["segs"]:
-                    for w in sorted([ww for ww in words if ww["seg"] == s], key=lambda wi: wi["bbox"][0]):
-                        r["words_ordered"].append(w)
-                r["text"] = row_text
-            # debug removed
+        # phone keeps its scanned override (OCR splits Indian mobiles differently)
+        pattern = IMAGE_PATTERN_OVERRIDES.get(rtype) or PATTERNS.get(rtype)
+        if not pattern:
+            continue
 
-            # find candidates in stream
+        if rtype == "money":
+            # (a) the text-path money pattern, on original AND shadow text.
+            money_ranges = []
+            for src, text in (("orig", stream), ("shadow", shadow)):
+                for m in re.finditer(pattern, text, re.IGNORECASE):
+                    g = m.group(0).strip()
+                    if not g:
+                        continue
+                    money_ranges.append((m.start(), m.end()))
+                    for i in _words_for_span(spans, m.start(), m.end()):
+                        hit.setdefault(i, rtype)
+            # (b) OCR-only fallback, ONLY for candidates the text pattern missed.
+            #     A bare number needs a MONEY_KEYWORD on the SAME ROW to its LEFT;
+            #     reject -, /, : or more than 9 digits.
             for m in _MONEY_SCANNED_RE.finditer(stream):
                 g = m.group(0).strip()
                 if not g:
                     continue
-                # rejections
+                if any(s < m.end() and e > m.start() for s, e in money_ranges):
+                    continue                      # text pattern already covered it
                 if '-' in g or '/' in g or ':' in g:
                     continue
-                dcount = sum(c.isdigit() for c in g)
-                if dcount > 9:
+                if sum(c.isdigit() for c in g) > 9:
                     continue
-                s, e = m.start(), m.end()
-                hit_words = _words_for_span(spans, s, e)
+                hit_words = _words_for_span(spans, m.start(), m.end())
                 if not hit_words:
                     continue
-                x0m = min(words[i]["bbox"][0] for i in hit_words)
-                x1m = max(words[i]["bbox"][2] for i in hit_words)
-                has_cur = bool(re.search(r"₹|Rs\.?|RS\.?|INR|\$|T[^\w]|\?|\%|\u20b9", g, re.IGNORECASE))
-                bare = re.fullmatch(r"(?:\d{1,3}(?:[,\s]\d{2,3})+(?:\.\d+)?|\d+(?:[,\s]\d{3})+(?:\.\d+)?|\d+\.\d+|\d+)", g)
-                accepted = True
-                reason = ""
+                has_cur = bool(re.search(
+                    r"₹|Rs\.?|RS\.?|INR|\$|T[^\w]|\?|\%|\u20b9", g, re.IGNORECASE))
+                bare = re.fullmatch(
+                    r"(?:\d{1,3}(?:[,\s]\d{2,3})+(?:\.\d+)?|\d+(?:[,\s]\d{3})+(?:\.\d+)?|\d+\.\d+|\d+)",
+                    g)
                 if bare and not has_cur:
-                    # find which row this number is on (overlap vertical center)
-                    cy_m = (min(words[i]["bbox"][1] for i in hit_words) + max(words[i]["bbox"][3] for i in hit_words)) / 2.0
-                    h_m = max(1.0, max(words[i]["bbox"][3] for i in hit_words) - min(words[i]["bbox"][1] for i in hit_words))
-                    # locate row
+                    cy_m = (min(words[i]["bbox"][1] for i in hit_words)
+                            + max(words[i]["bbox"][3] for i in hit_words)) / 2.0
                     target_row = None
                     for r in rows:
-                        if cy_m >= r["cy0"] - 0.5 * r["h_avg"] and cy_m <= r["cy1"] + 0.5 * r["h_avg"]:
+                        if (cy_m >= r["cy0"] - 0.5 * r["h_avg"]
+                                and cy_m <= r["cy1"] + 0.5 * r["h_avg"]):
                             target_row = r
                             break
                     if not target_row:
-                        accepted, reason = False, "no row found"
-                    else:
-                        # look for keyword to the LEFT of number in this row's ordered words
-                        has_kw_left = False
-                        num_x0 = x0m
-                        for w in target_row["words_ordered"]:
-                            if w["bbox"][2] < num_x0 - 1:  # left
-                                if any(kw in _latinize(w["text"]).upper() for kw in MONEY_KEYWORDS):
-                                    has_kw_left = True
-                                    break
-                        if not has_kw_left:
-                            accepted, reason = False, "no keyword left in row"
-                        else:
-                            accepted, reason = True, "keyword left found"
-                else:
-                    accepted, reason = True, "has currency or explicit"
-
-                if not accepted:
-                    continue
+                        continue
+                    num_x0 = min(words[i]["bbox"][0] for i in hit_words)
+                    has_kw_left = any(
+                        w["bbox"][2] < num_x0 - 1
+                        and any(kw in _latinize(w["text"]).upper() for kw in MONEY_KEYWORDS)
+                        for w in target_row["words_ordered"])
+                    if not has_kw_left:
+                        continue
                 for i in hit_words:
                     hit.setdefault(i, rtype)
             continue
-            # Build rows from segments: two segments in same row if vertical centers overlap
-            segs_list = list(range(len(words)))  # not directly; use words by segment index
-            # easier: group by segment index
-            pass
 
-        pat = IMAGE_PATTERN_OVERRIDES.get(rtype) or PATTERNS.get(rtype)
-        if not pat:
-            continue
-        for m in re.finditer(pat, stream, re.IGNORECASE):
-            if not m.group(0).strip():
-                continue
-            for i in _words_for_span(spans, m.start(), m.end()):
-                hit.setdefault(i, rtype)
+        # generic types: same pattern on original and shadow, union of hits
+        for src, text in (("orig", stream), ("shadow", shadow)):
+            for m in re.finditer(pattern, text, re.IGNORECASE):
+                g = m.group(0).strip()
+                if not g:
+                    continue
+                idxs = _words_for_span(spans, m.start(), m.end())
+                for i in idxs:
+                    hit.setdefault(i, rtype)
+                if rtype == "phone":
+                    phone_hits.append((g, idxs))
 
-        pat = IMAGE_PATTERN_OVERRIDES.get(rtype) or PATTERNS.get(rtype)
-        if not pat:
-            continue
-        for m in re.finditer(pat, stream, re.IGNORECASE):
-            if not m.group(0).strip():
+    # Post-filter phone hits (scanned path only). Keep a phone match when it
+    # carries explicit phone punctuation (+ or "("), or when a phone keyword
+    # sits on the SAME ROW to its LEFT (same row grouping as the money check).
+    # Otherwise a bare digits-only run is dropped; anything with separators
+    # (space, hyphen, dot, ...) is kept exactly as before.
+    if "phone" in redact_types:
+        _PHONE_KEYWORDS = ('PHONE', 'PHONENO', 'MOBILE', 'MOB', 'TEL',
+                           'TELEPHONE', 'CONTACT', 'CELL', 'WHATSAPP')
+        keep_idx = set()
+        for g, idxs in phone_hits:
+            if not idxs:
                 continue
-            for i in _words_for_span(spans, m.start(), m.end()):
-                hit.setdefault(i, rtype)
+            if '+' in g or '(' in g:
+                keep_idx.update(idxs)
+                continue
+            cy_m = (min(words[i]["bbox"][1] for i in idxs)
+                    + max(words[i]["bbox"][3] for i in idxs)) / 2.0
+            target_row = None
+            for r in rows:
+                if (cy_m >= r["cy0"] - 0.5 * r["h_avg"]
+                        and cy_m <= r["cy1"] + 0.5 * r["h_avg"]):
+                    target_row = r
+                    break
+            kw_left = bool(target_row) and any(
+                w["bbox"][2] < min(words[i]["bbox"][0] for i in idxs) - 1
+                and any(k in _latinize(w["text"]).upper() for k in _PHONE_KEYWORDS)
+                for w in target_row["words_ordered"])
+            if kw_left or not g.isdigit():
+                keep_idx.update(idxs)
+        for _g, idxs in phone_hits:
+            for i in idxs:
+                if i not in keep_idx and hit.get(i) == "phone":
+                    del hit[i]
+
+    # Extend a date hit to a following time token ("19:30:20") on the SAME ROW
+    # so one box covers date + time. The stream separates rows/columns with
+    # ' ¦ ', so the leading \s* cannot bridge two rows.
+    if "date" in redact_types:
+        _time_re = re.compile(r"\s*(\d{1,2}:\d{2}(?::\d{2})?)")
+        for i in [k for k, t in list(hit.items()) if t == "date"]:
+            tm = _time_re.match(stream, spans[i][1])
+            if not tm:
+                continue
+            for j in _words_for_span(spans, tm.start(1), tm.end(1)):
+                if words[j]["row"] == words[i]["row"]:
+                    hit.setdefault(j, "date")
 
     # 2. address: OCR rows that are clearly an address are covered fully, plus
     #    the cue-less lines directly below them (city / county such as "Reading,"
@@ -1053,6 +1187,7 @@ def _match_words(words: list, stream: str, spans: list,
         tgt = _clean_tok(_latinize(term))
         if not tgt:
             continue
+        term_hit = False
         for i in range(len(words)):
             cat, last, nxt = "", -1, i
             while nxt < len(words):
@@ -1073,9 +1208,50 @@ def _match_words(words: list, stream: str, spans: list,
                 need = 0.90 if len(tgt) == 4 else 0.84
                 good = SequenceMatcher(None, tgt, cat).ratio() >= need
             if good:
+                term_hit = True
                 for j in range(i, last + 1):
                     if norm[j]:
                         hit.setdefault(j, "custom")
+        print(f"  [dbg custom] term={term!r} exact_hit={term_hit}")
+
+        # Fuzzy fallback (scanned path only) for terms the exact pass missed.
+        # Windows of N consecutive OCR tokens (N = words in the term) are taken
+        # from the joined stream and its shadow; both sides are lowercased with
+        # spaces removed. First-2-chars must agree; ratio thresholds depend on
+        # term length; only the best window per term is kept.
+        if not term_hit:
+            n_top = len(term.split())
+            term_sp = re.sub(r"\s+", "", term).lower()
+            L = len(term_sp)
+            if n_top >= 1 and L >= 5:
+                need = 0.90 if L <= 7 else 0.80
+                best = None
+                for src_text in (stream, shadow):
+                    for i in range(len(words) - n_top + 1):
+                        sub = src_text[spans[i][0]:spans[i + n_top - 1][1]]
+                        if "¦" in sub:
+                            print(f"    [dbg cand] i={i} sub={sub!r} -> reject (separator)")
+                            continue
+                        w_sp = re.sub(r"\s+", "", sub).lower()
+                        f2 = len(w_sp) >= 2 and w_sp[:2] == term_sp[:2]
+                        r = SequenceMatcher(None, term_sp, w_sp).ratio()
+                        if not f2:
+                            print(f"    [dbg cand] i={i} sub={sub!r} ratio={r:.3f} "
+                                  f"first2=FAIL -> reject")
+                            continue
+                        verdict = "PASS" if r >= need else "reject"
+                        print(f"    [dbg cand] i={i} sub={sub!r} ratio={r:.3f} "
+                              f"first2=OK need={need} -> {verdict}")
+                        if r >= need and (best is None or r > best[0]):
+                            best = (r, list(range(i, i + n_top)))
+                if best:
+                    print(f"    [dbg custom] ACCEPT best ratio={best[0]:.3f} words={best[1]}")
+                    for j in best[1]:
+                        hit.setdefault(j, "custom")
+                else:
+                    print(f"    [dbg custom] REJECT no window passed")
+            else:
+                print(f"    [dbg custom] fallback skipped (n_top={n_top}, L={L})")
     return hit
 
 
@@ -1089,7 +1265,10 @@ def _boxes_from_hits(words: list, hit: dict) -> list:
         w = words[i]
         x0, y0, x1, y1 = w["bbox"]
         h = max(1, y1 - y0)
-        if (cur and prev_i == i - 1 and cur["seg"] == w["seg"]
+        # Merge when the hit spans consecutive words on the same row even if
+        # they came from different OCR segments (a regex hit that crossed a
+        # segment boundary must become one box).
+        if (cur and prev_i == i - 1
                 and x0 - cur["x1"] <= 3 * h and cur["row"] == w["row"]):
             cur["x0"], cur["y0"] = min(cur["x0"], x0), min(cur["y0"], y0)
             cur["x1"], cur["y1"] = max(cur["x1"], x1), max(cur["y1"], y1)
