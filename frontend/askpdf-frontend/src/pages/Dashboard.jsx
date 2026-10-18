@@ -23,10 +23,16 @@ const ICON_COLORS = [
 // Formats a byte count into a human-readable size (KB/MB), based on
 // the real file size returned by the backend — never hardcoded.
 function formatFileSize(bytes) {
-  if (bytes == null || isNaN(bytes)) return "Unknown size";
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes === null || bytes === undefined) return "Unknown size";
+  let val = bytes;
+  if (typeof val === "string") {
+    val = parseInt(val, 10);
+  }
+  if (typeof val !== "number" || isNaN(val)) return "Unknown size";
+  if (val === 0) return "0 B";
+  if (val < 1024) return `${val} B`;
+  if (val < 1024 * 1024) return `${(val / 1024).toFixed(0)} KB`;
+  return `${(val / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 // Turns the backend's "ingested_at" timestamp (e.g. "2026-06-24 06:21")

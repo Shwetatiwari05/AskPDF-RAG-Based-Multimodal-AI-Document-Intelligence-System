@@ -14,6 +14,7 @@ def insert_document(metadata, user_id):
             "source_path": None,
             "storage_path": metadata.get("storage_path"),
             "used_for": metadata.get("used_for", "chat"),
+            "file_size": metadata.get("file_size"),
         })
         .execute()
     )

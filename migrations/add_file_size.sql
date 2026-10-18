@@ -1,0 +1,1 @@
+alter table documents add column if not exists file_size bigint;
