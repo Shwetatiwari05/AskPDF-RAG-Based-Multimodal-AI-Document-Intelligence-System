@@ -36,8 +36,6 @@ from pathlib import Path
 
 from core.ocr_extractor import extract_text_smart, is_scanned_pdf
 from core.preprocess import clean_text, chunk_text
-from core.embedder import generate_embeddings
-from core.vector_store import create_vector_store, save_vector_store, load_vector_store
 from core.db import get_document
 from core.supabase_client import supabase
 
@@ -323,6 +321,7 @@ def ingest_pdf(
     import gc
 
     try:
+        from core.embedder import generate_embeddings
         embeddings = generate_embeddings(chunks)
 
         print(
@@ -337,6 +336,7 @@ def ingest_pdf(
 
     # ── Step 5: Save vector store ─────────────────────────────────
     print("Step 5/5: Building & saving vector store...")
+    from core.vector_store import create_vector_store, save_vector_store
     index = create_vector_store(embeddings)
     save_vector_store(
         index, chunks,
@@ -448,6 +448,7 @@ def load_pdf_store(user_id: str, pdf_id: str):
             f"No vector store found for pdf_id={pdf_id}, user_id={user_id}"
         )
 
+    from core.vector_store import load_vector_store
     index, chunks = load_vector_store(
         index_path=str(index_path),
         chunks_path=str(chunks_path),

@@ -2,7 +2,6 @@ from core.embedder import get_model
 import faiss
 import numpy as np
 import pickle
-from sentence_transformers import CrossEncoder
 
 
 def create_vector_store(embeddings):
@@ -66,7 +65,7 @@ def search(query, index, chunks, top_k=5):
         [f"Represent this sentence for searching relevant passages: {query}"],
         normalize_embeddings=True
 
-)
+    )
     # Convert to float32
     query_embedding = np.array(
         query_embedding,
@@ -95,21 +94,31 @@ def search(query, index, chunks, top_k=5):
 
     return results
 
-# Load the reranker model to perform relevance-based reranking of the search results
-reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+
+_reranker = None
+
+
+def _get_reranker():
+    global _reranker
+    if _reranker is None:
+        from sentence_transformers import CrossEncoder
+        _reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+    return _reranker
+
 
 def rerank(query, results, top_k=3):
     # Create pairs of query and chunk text for reranking
     pairs = [[query, result["text"]] for result in results]
-    
+
     # Get relevance scores from the reranker model
+    reranker = _get_reranker()
     scores = reranker.predict(pairs)
-    
+
     # Add reranking scores to results
     for i, result in enumerate(results):
         result["rerank_score"] = float(scores[i])
-    
+
     # Sort results by reranking score in descending order and return the top_k results
     reranked = sorted(results, key=lambda x: x["rerank_score"], reverse=True)
-    
+
     return reranked[:top_k]
